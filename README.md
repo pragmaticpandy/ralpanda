@@ -18,5 +18,5 @@ cd ~/.claude/skills && git clone https://github.com/pragmaticpandy/ralpanda.git
 Tests MUST be run before considering a change complete.
 
 ```bash
-cd skills/ralpanda/scripts && python3 -m unittest discover -s ralpanda -p 'test_*.py' -v
+cd scripts && python3 -m unittest discover -s ralpanda -p 'test_*.py' -v
 ```

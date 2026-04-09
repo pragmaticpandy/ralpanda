@@ -245,6 +245,8 @@ Analyze the plan and break it into atomic work tasks. Each task must be completa
 
 8. **Task-specific verification**: For each work task, suggest any task-specific verification steps beyond the default review checks (e.g., "manually test the login flow", "verify the migration is reversible", "check the API response shape matches the spec"). Add these to the task's `acceptance_criteria`.
 
+9. **Cross-plan dependencies**: When the new plan is independent from existing tasks (i.e., not extending or building on prior work), all root tasks of the new plan — those with no intra-plan dependencies — must depend on every `delete_base_sha` task currently in tasks.json. This ensures prior plans' cleanup completes and the diff baseline is properly reset before the new plan's work begins. If there are no existing `delete_base_sha` tasks, no extra dependencies are needed.
+
 10. **Present the full task list to the user for confirmation** before writing. Show each task with its title, dependencies, description summary, and acceptance criteria (including any task-specific verification). Ask the user to approve, reorder, merge, split, or modify tasks. Do NOT write `tasks.json` until they confirm.
 
 ### Validate and Write
@@ -346,7 +348,8 @@ Other:
 
 TUI Keyboard Shortcuts (in the loop terminal):
   ↑/↓    Navigate task list
-  p      Insert pause (before selected task, or global if none selected)
+  p      Insert pause before selected task
+  P      Pause next (global pause, blocks all pending tasks)
   r      Resume paused loop
   q      Graceful quit (finish current task)
   Q      Force quit (kill agent immediately)

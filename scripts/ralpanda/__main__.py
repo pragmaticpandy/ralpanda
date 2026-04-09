@@ -21,7 +21,7 @@ class LoopState:
     config: dict
     tasks: list[dict] = field(default_factory=list)
     tasks_mtime: float = 0.0
-    state: str = "running"  # running | paused | waiting_dirty | waiting_done | waiting_blocked
+    state: str = "running"  # running | paused | waiting_done | waiting_blocked
     state_info: str = ""    # human-readable context for current state, always set via set_state
     current_task_id: str | None = None
     agent_proc: object | None = None  # subprocess.Popen
@@ -33,7 +33,7 @@ class LoopState:
     exit_reason: str | None = None
 
     # States that must always carry an explanation
-    _REQUIRES_INFO = frozenset({"waiting_blocked", "waiting_dirty", "waiting_done", "paused", "idle"})
+    _REQUIRES_INFO = frozenset({"waiting_blocked", "waiting_done", "paused", "idle"})
 
     def set_state(self, state: str, info: str = "") -> None:
         """Set loop state with required context info.
@@ -135,13 +135,20 @@ def handle_input(key: int, tui_state: tui.TUIState, loop_state: LoopState) -> No
     is_review = selected and selected.get("type") == "review"
     max_panels = 3 if is_review else 2
 
-    if key == ord("\t"):
-        # Cycle focus: 0 (task list) -> 1 (detail/check list) -> 2 (check log, review only) -> 0
-        tui_state.focus_panel = (tui_state.focus_panel + 1) % max_panels
-        # Reset scroll for the panel we just left
-        if tui_state.focus_panel == 0:
+    if key == curses.KEY_RIGHT:
+        old = tui_state.focus_panel
+        tui_state.focus_panel = min(tui_state.focus_panel + 1, max_panels - 1)
+        if tui_state.focus_panel != old and old == 0:
             tui_state.detail_scroll = 0
             tui_state.check_detail_scroll = 0
+
+    elif key == curses.KEY_LEFT:
+        old = tui_state.focus_panel
+        tui_state.focus_panel = max(tui_state.focus_panel - 1, 0)
+        if old != tui_state.focus_panel:
+            if tui_state.focus_panel == 0:
+                tui_state.detail_scroll = 0
+                tui_state.check_detail_scroll = 0
 
     elif key == curses.KEY_UP:
         if tui_state.focus_panel == 1 and is_review:
@@ -156,6 +163,7 @@ def handle_input(key: int, tui_state: tui.TUIState, loop_state: LoopState) -> No
         else:
             tui_state.auto_follow = False
             tui_state.selected_idx = max(0, tui_state.selected_idx - 1)
+            tui_state._selected_task_id = ""  # let render persist new selection
             tui_state.detail_scroll = 0
 
     elif key == curses.KEY_DOWN:
@@ -173,6 +181,7 @@ def handle_input(key: int, tui_state: tui.TUIState, loop_state: LoopState) -> No
             tui_state.auto_follow = False
             if task_count > 0:
                 tui_state.selected_idx = min(task_count - 1, tui_state.selected_idx + 1)
+            tui_state._selected_task_id = ""  # let render persist new selection
             tui_state.detail_scroll = 0
 
     elif key == curses.KEY_PPAGE:  # Page Up
@@ -192,14 +201,16 @@ def handle_input(key: int, tui_state: tui.TUIState, loop_state: LoopState) -> No
         tui_state.detail_scroll = 0
 
     elif key == ord("p"):
-        # Insert pause
+        # Insert pause before selected task only
         selected = tui_state._selected_task()
         if selected and selected["status"] == "pending":
             dag.insert_pause_before(loop_state.tasks_file, selected["id"])
             loop_state.reload_tasks()
-        else:
-            dag.insert_global_pause(loop_state.tasks_file)
-            loop_state.reload_tasks()
+
+    elif key == ord("P"):
+        # Insert global pause (blocks all pending tasks)
+        dag.insert_global_pause(loop_state.tasks_file)
+        loop_state.reload_tasks()
 
     elif key == ord("r"):
         # Resume
@@ -219,6 +230,15 @@ def handle_input(key: int, tui_state: tui.TUIState, loop_state: LoopState) -> No
     elif key == ord("f"):
         tui_state.auto_follow = True
 
+    elif key == ord("c"):
+        # Clear tasks from fully-done plans
+        removed = dag.clear_done_plans(loop_state.tasks_file)
+        if removed:
+            loop_state.reload_tasks()
+            tui_state.selected_idx = 0
+            tui_state._selected_task_id = ""
+            tui_state.detail_scroll = 0
+
 
 # ---------------------------------------------------------------------------
 # Loop advancement
@@ -228,20 +248,6 @@ def advance_loop(loop_state: LoopState, tui_state: tui.TUIState) -> None:
     """Try to dispatch the next task. Only called when no agent is running."""
     loop_state.reload_tasks()
     tasks = loop_state.tasks
-
-    # Check git is clean
-    if not git.is_clean():
-        dirty_info = git.dirty_summary()
-        if loop_state.state != "waiting_dirty":
-            _write_state(loop_state, "waiting_dirty")
-            dag.log_event(loop_state.history_file, "waiting_dirty")
-        loop_state.set_state("waiting_dirty", dirty_info)
-        return
-
-    if loop_state.state == "waiting_dirty":
-        loop_state.set_state("running", f"task {loop_state.current_task_id or 'next'}")
-        _write_state(loop_state, "running")
-        dag.log_event(loop_state.history_file, "dirty_resolved")
 
     # Check sentinels
     exit_sentinel = loop_state.ralpanda_dir / "sentinels" / "exit"
@@ -267,12 +273,24 @@ def advance_loop(loop_state: LoopState, tui_state: tui.TUIState) -> None:
             loop_state.set_state("waiting_blocked", dag.blocked_reason(tasks))
         return
 
+    task_id = next_task["id"]
+    task_type = next_task.get("type", "work")
+
+    # Git must be clean before starting any non-pause task.
+    # Check here (not every tick) because git status is expensive.
+    if task_type != "pause" and not git.is_clean():
+        dirty_info = git.dirty_summary()
+        dag.log_event(loop_state.history_file, "git_dirty", task_id, dirty_info)
+        pause_id = dag.insert_dirty_pause(loop_state.tasks_file, task_id, dirty_info)
+        loop_state.reload_tasks()
+        if pause_id:
+            dag.log_event(loop_state.history_file, "dirty_pause_inserted", pause_id)
+        return
+
     loop_state.set_state("running", next_task["id"])
     _write_state(loop_state, "running")
     loop_state.iteration += 1
 
-    task_id = next_task["id"]
-    task_type = next_task.get("type", "work")
     loop_state.current_task_id = task_id
     (loop_state.ralpanda_dir / "current_task").write_text(task_id)
 
@@ -531,7 +549,7 @@ def main_loop(stdscr, loop_state: LoopState) -> None:
         if (
             loop_state.agent_proc is None
             and loop_state.review_state is None
-            and loop_state.state in ("running", "waiting_dirty", "waiting_done", "waiting_blocked")
+            and loop_state.state in ("running", "waiting_done", "waiting_blocked")
             and not loop_state.should_exit
         ):
             advance_loop(loop_state, tui_state)

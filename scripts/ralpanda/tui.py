@@ -35,7 +35,6 @@ LOOP_STATE_LABEL = {
     "running":         "RUNNING",
     "paused":          "PAUSED",
     "idle":            "IDLE",
-    "waiting_dirty":   "DIRTY",
     "waiting_done":    "ALL DONE",
     "waiting_blocked": "BLOCKED",
 }
@@ -60,10 +59,13 @@ def init_colors() -> None:
     # Status bar backgrounds
     curses.init_pair(8, curses.COLOR_BLACK, curses.COLOR_GREEN)  # loop running
     curses.init_pair(9, curses.COLOR_BLACK, curses.COLOR_YELLOW) # loop paused
-    curses.init_pair(10, curses.COLOR_BLACK, curses.COLOR_RED)   # loop blocked/idle
+    curses.init_pair(10, curses.COLOR_WHITE, curses.COLOR_RED)   # loop blocked/idle
     # Detail panel: check pass/fail
     curses.init_pair(11, curses.COLOR_GREEN, -1)    # check pass
     curses.init_pair(12, curses.COLOR_YELLOW, -1)   # check warn
+    # Pane headers
+    curses.init_pair(13, curses.COLOR_BLACK, curses.COLOR_CYAN)   # focused pane header
+    curses.init_pair(14, curses.COLOR_CYAN, -1)                   # focused divider
 
 
 def _dag_depth(tasks: list[dict]) -> dict[str, int]:
@@ -134,6 +136,8 @@ class TUIState:
     focus_panel: int = 0  # 0=task list, 1=detail/check list, 2=check log (review only)
     # Track which task's log we're tailing (to reset pos on task change)
     _tailing_task_id: str = ""
+    # Track selected task by ID so selection survives list reordering/insertion
+    _selected_task_id: str = ""
     # Track selected task's status to reset detail_scroll on status change
     _detail_task_status: str = ""
     # Cached display list (rebuilt each render)
@@ -192,17 +196,22 @@ class TUIState:
         # Build grouped display list
         self._display_list = _build_display_list(loop_state.tasks)
 
-        # Reserve bottom 2 lines for status bar
+        # Reserve bottom 2 lines for status bar, top 1 line for pane headers
         status_y = height - 2
-        content_height = status_y
+        header_y = 0
+        content_y = 1
+        content_height = status_y - 1
 
         # Split: left 40%, right 60%
         left_width = max(25, width * 2 // 5)
         right_x = left_width + 1
         right_width = width - right_x
 
-        self._render_task_list(loop_state, 0, 0, left_width, content_height)
-        self._render_divider(left_width, 0, content_height)
+        # Pane headers
+        self._render_pane_header("TASKS", 0, header_y, left_width, self.focus_panel == 0)
+
+        self._render_task_list(loop_state, 0, content_y, left_width, content_height)
+        self._render_divider(left_width, 0, status_y, focused=self.focus_panel in (0, 1))
 
         # For review tasks, split the right pane into check list + check detail
         selected = self._selected_task()
@@ -212,14 +221,17 @@ class TUIState:
             far_x = right_x + mid_width + 1
             far_width = width - far_x
 
-            self._render_check_list(loop_state, selected, right_x, 0, mid_width, content_height)
-            self._render_divider(right_x + mid_width, 0, content_height)
-            self._render_check_detail(loop_state, selected, far_x, 0, far_width, content_height)
+            self._render_pane_header("CHECKS", right_x, header_y, mid_width, self.focus_panel == 1)
+            self._render_check_list(loop_state, selected, right_x, content_y, mid_width, content_height)
+            self._render_divider(right_x + mid_width, 0, status_y, focused=self.focus_panel in (1, 2))
+            self._render_pane_header("DETAIL", far_x, header_y, far_width, self.focus_panel == 2)
+            self._render_check_detail(loop_state, selected, far_x, content_y, far_width, content_height)
         else:
             # Clamp focus_panel for non-review tasks
             if self.focus_panel > 1:
                 self.focus_panel = 1
-            self._render_detail_panel(loop_state, right_x, 0, right_width, content_height)
+            self._render_pane_header("DETAIL", right_x, header_y, right_width, self.focus_panel == 1)
+            self._render_detail_panel(loop_state, right_x, content_y, right_width, content_height)
 
         self._render_status_bar(loop_state, 0, status_y, width)
 
@@ -239,6 +251,17 @@ class TUIState:
         if task_count == 0:
             return
 
+        # Restore selection by task ID (survives list reordering/insertion)
+        if self._selected_task_id:
+            idx = 0
+            for item in display:
+                if isinstance(item, str):
+                    continue
+                if item["id"] == self._selected_task_id:
+                    self.selected_idx = idx
+                    break
+                idx += 1
+
         # Auto-follow running task
         if self.auto_follow and loop_state.current_task_id:
             idx = 0
@@ -252,6 +275,16 @@ class TUIState:
 
         # Clamp selected index
         self.selected_idx = max(0, min(self.selected_idx, task_count - 1))
+
+        # Persist selected task ID for next render cycle
+        task_idx = 0
+        for item in display:
+            if isinstance(item, str):
+                continue
+            if task_idx == self.selected_idx:
+                self._selected_task_id = item["id"]
+                break
+            task_idx += 1
 
         # Build flat list of (is_header, label_or_task, is_selected) for rendering
         rows: list[tuple] = []  # (type, data, is_selected)
@@ -335,16 +368,25 @@ class TUIState:
 
                 self.safe_addstr(y + row_i, x, line[:width], color | attr, width)
 
-    def _render_divider(self, x: int, y: int, height: int) -> None:
-        """Render vertical divider."""
+    def _render_divider(self, x: int, y: int, height: int, focused: bool = False) -> None:
+        """Render vertical divider. Highlighted when adjacent to focused pane."""
+        attr = curses.color_pair(14) | curses.A_BOLD if focused else curses.A_DIM
         for row in range(height):
-            self.safe_addstr(y + row, x, "│", curses.A_DIM)
+            self.safe_addstr(y + row, x, "│", attr)
+
+    def _render_pane_header(self, title: str, x: int, y: int, width: int, focused: bool) -> None:
+        """Render a pane header row. Reverse-video when focused, dim otherwise."""
+        if focused:
+            attr = curses.color_pair(13) | curses.A_BOLD
+        else:
+            attr = curses.A_DIM
+        self.safe_addstr(y, x, f" {title} ".ljust(width)[:width], attr, width)
 
     def _render_detail_panel(self, loop_state, x: int, y: int, width: int, height: int) -> None:
         """Render the right-side detail panel.
 
         Layout: metadata at top, then log below (newest first).
-        Tab key toggles focus to detail panel for scrolling.
+        Left/Right arrows move focus between panes for scrolling.
         """
         task = self._selected_task()
         if not task:
@@ -494,10 +536,6 @@ class TUIState:
         max_scroll = max(0, len(lines) - height)
         self.detail_scroll = max(0, min(self.detail_scroll, max_scroll))
 
-        # Focus indicator
-        if self.focus_panel == 1:
-            self.safe_addstr(y, x + width - 4, " ◀ ", curses.A_BOLD | curses.color_pair(2))
-
         for i in range(height):
             li = self.detail_scroll + i
             if li >= len(lines):
@@ -557,13 +595,26 @@ class TUIState:
             header += f"  ({dur})"
         self.safe_addstr(y, x, header[:width].ljust(width), curses.A_BOLD | curses.color_pair(2), width)
 
-        # Focus indicator
-        if self.focus_panel == 1:
-            self.safe_addstr(y, x + width - 4, " ◀ ", curses.A_BOLD | curses.color_pair(2))
+        # Metadata rows (status, plan source, deps)
+        meta_row = y + 1
+        status_text = f" [{status}]  type:{task.get('type', 'review')}  attempt:{task.get('attempt', 0)}"
+        self.safe_addstr(meta_row, x, status_text[:width].ljust(width), curses.A_DIM, width)
+        meta_row += 1
+
+        plan_source = task.get("plan_source", "")
+        if plan_source:
+            self.safe_addstr(meta_row, x, f" Plan: {plan_source}"[:width].ljust(width), curses.A_DIM, width)
+            meta_row += 1
+
+        deps = task.get("depends_on", [])
+        if deps:
+            dep_strs = [d.split("/")[-1] for d in deps]
+            self.safe_addstr(meta_row, x, f" Deps: {', '.join(dep_strs)}"[:width].ljust(width), curses.A_DIM, width)
+            meta_row += 1
 
         # Render entries
         for i, entry in enumerate(entries):
-            row = y + 1 + i
+            row = meta_row + i
             if row >= y + height:
                 break
 
@@ -696,10 +747,6 @@ class TUIState:
         max_scroll = max(0, len(lines) - height)
         self.check_detail_scroll = max(0, min(self.check_detail_scroll, max_scroll))
 
-        # Focus indicator
-        if self.focus_panel == 2:
-            self.safe_addstr(y, x + width - 4, " ◀ ", curses.A_BOLD | curses.color_pair(2))
-
         for i in range(height):
             li = self.check_detail_scroll + i
             if li >= len(lines):
@@ -754,13 +801,13 @@ class TUIState:
 
         from . import git
         base_sha = git.get_base_sha(loop_state.ralpanda_dir)
-        sha_part = f"Base: {base_sha[:7] if base_sha else 'not set'}"
+        sha_part = f"Base SHA for reviews: {base_sha[:7] if base_sha else 'not set'}"
         if left:
             left += f"  {sha_part}"
         else:
             left = f" {sha_part}"
 
-        hints = "q:quit  Q:force kill  p:pause  r:resume  Tab:focus  ↑↓:nav"
+        hints = "q:quit  Q:force kill  p:pause before  P:pause next  r:resume  c:clear done  ←→:pane  ↑↓:nav"
         pad = width - 1 - len(left) - len(hints)
         if pad > 2:
             line2 = left + " " * pad + hints

@@ -385,6 +385,67 @@ def insert_pause_before(tasks_file: Path, before_id: str, plan_source: str | Non
         return pause_id
 
 
+def insert_dirty_pause(tasks_file: Path, before_id: str, dirty_info: str) -> str | None:
+    """Insert a pause task before *before_id* because git is dirty.
+
+    Returns the pause task ID, or None if a dirty-pause already blocks this task.
+    """
+    with locked_tasks(tasks_file) as data:
+        tasks = data["tasks"]
+        target = None
+        for t in tasks:
+            if t["id"] == before_id:
+                target = t
+                break
+        if not target:
+            return None
+
+        # Don't stack dirty pauses — check if one already blocks this task
+        target_deps = set(target.get("depends_on", []))
+        for t in tasks:
+            if (
+                t["type"] == "pause"
+                and t["status"] == "pending"
+                and t["id"] in target_deps
+                and t.get("pause_reason", "").startswith("git dirty")
+            ):
+                return None
+
+        slug = plan_slug_from_source(target.get("plan_source"))
+        pause_id = next_task_id(tasks, slug)
+        pause_task = {
+            "id": pause_id,
+            "title": "Pause (git dirty)",
+            "type": "pause",
+            "pause_reason": f"git dirty: {dirty_info}",
+            "status": "pending",
+            "depends_on": list(target.get("depends_on", [])),
+            "plan_source": target.get("plan_source"),
+            "description": f"Auto-inserted because git was dirty before starting {before_id}.",
+            "acceptance_criteria": [],
+            "outcome": None,
+            "attempt": 0,
+            "created_at": _now_iso(),
+            "started_at": None,
+            "completed_at": None,
+        }
+
+        # Insert before target
+        for i, t in enumerate(tasks):
+            if t["id"] == before_id:
+                data["tasks"] = tasks[:i] + [pause_task] + tasks[i:]
+                break
+
+        # Add pause as dependency of target
+        for t in data["tasks"]:
+            if t["id"] == before_id:
+                deps = list(dict.fromkeys(t.get("depends_on", []) + [pause_id]))
+                t["depends_on"] = deps
+                break
+
+        return pause_id
+
+
 def insert_global_pause(tasks_file: Path) -> str | None:
     """Insert a pause task as a dependency of ALL pending non-pause tasks.
     Returns the pause task ID, or None if there's already a pending global pause."""
@@ -429,6 +490,47 @@ def insert_global_pause(tasks_file: Path) -> str | None:
                 t["depends_on"] = deps
 
         return pause_id
+
+
+def clear_done_plans(tasks_file: Path) -> int:
+    """Remove tasks belonging to plans where every task in that plan is done/split.
+
+    A plan is identified by its plan_source.  If ANY task in a plan is not in a
+    terminal state (done/split), no tasks from that plan are removed.  Tasks
+    with plan_source=None (_gate tasks) are treated as their own implicit plan
+    group.
+
+    Also cleans up dependency references to removed task IDs.
+
+    Returns the number of tasks removed.
+    """
+    with locked_tasks(tasks_file) as data:
+        tasks = data["tasks"]
+
+        # Group task indices by plan_source
+        plans: dict[str | None, list[int]] = {}
+        for i, t in enumerate(tasks):
+            ps = t.get("plan_source")
+            plans.setdefault(ps, []).append(i)
+
+        # Determine which plan groups are fully done
+        remove_ids: set[str] = set()
+        for ps, indices in plans.items():
+            if all(tasks[i]["status"] in ("done", "split") for i in indices):
+                for i in indices:
+                    remove_ids.add(tasks[i]["id"])
+
+        if not remove_ids:
+            return 0
+
+        # Remove tasks and clean up dependency references
+        data["tasks"] = [t for t in tasks if t["id"] not in remove_ids]
+        for t in data["tasks"]:
+            deps = t.get("depends_on", [])
+            if any(d in remove_ids for d in deps):
+                t["depends_on"] = [d for d in deps if d not in remove_ids]
+
+        return len(remove_ids)
 
 
 # ---------------------------------------------------------------------------
