@@ -1,4 +1,4 @@
-"""Tests for dag.py — run with: python -m pytest ralpanda/test_dag.py or python ralpanda/test_dag.py"""
+"""Tests for dag.py — run with: python -m unittest ralpanda.test_dag or python ralpanda/test_dag.py"""
 
 import json
 import os
@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-# Allow running standalone or via pytest
+# Allow running standalone or via unittest discovery.
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -71,6 +71,12 @@ class TestValidation(unittest.TestCase):
         ]
         self.assertIn("duplicate_ids", dag.validate_tasks(tasks))
 
+    def test_missing_dependency(self):
+        tasks = [
+            {"id": "a", "status": "pending", "depends_on": ["missing"]},
+        ]
+        self.assertIn("missing_dependencies", dag.validate_tasks(tasks))
+
     def test_self_cycle(self):
         tasks = [{"id": "a", "status": "pending", "depends_on": ["a"]}]
         self.assertEqual(dag.validate_tasks(tasks), "cycle_detected")
@@ -102,6 +108,93 @@ class TestAllDone(unittest.TestCase):
             {"id": "b", "status": "pending"},
         ]
         self.assertFalse(dag.all_done(tasks))
+
+
+class TestReviewCheckStages(unittest.TestCase):
+    def test_flat_checks_are_one_stage(self):
+        task = {
+            "checks": [
+                {"name": "typecheck", "mode": "isolated"},
+                {"name": "lint", "mode": "parallel"},
+            ],
+        }
+
+        checks, stages = dag.review_check_stages(task)
+
+        self.assertEqual([c["name"] for c in checks], ["typecheck", "lint"])
+        self.assertEqual(stages, [{"name": "checks", "check_indices": [0, 1]}])
+
+    def test_check_stages_are_flattened_in_order(self):
+        task = {
+            "check_stages": [
+                {
+                    "name": "cheap",
+                    "checks": [{"name": "typecheck", "mode": "isolated"}],
+                },
+                {
+                    "name": "expensive",
+                    "checks": [{"name": "e2e", "mode": "isolated"}],
+                },
+            ],
+        }
+
+        checks, stages = dag.review_check_stages(task)
+
+        self.assertEqual([c["name"] for c in checks], ["typecheck", "e2e"])
+        self.assertEqual(checks[0]["stage"], "cheap")
+        self.assertEqual(checks[1]["stage"], "expensive")
+        self.assertEqual(stages, [
+            {"name": "cheap", "check_indices": [0]},
+            {"name": "expensive", "check_indices": [1]},
+        ])
+
+    def test_plan_completeness_moves_to_first_stage(self):
+        task = {
+            "check_stages": [
+                {
+                    "name": "cheap",
+                    "checks": [{"name": "typecheck", "mode": "isolated"}],
+                },
+                {
+                    "name": "expensive",
+                    "checks": [
+                        {"name": "e2e", "mode": "isolated"},
+                        {"name": "plan-completeness", "mode": "parallel"},
+                    ],
+                },
+            ],
+        }
+
+        checks, stages = dag.review_check_stages(task)
+
+        self.assertEqual(
+            [c["name"] for c in checks],
+            ["typecheck", "plan-completeness", "e2e"],
+        )
+        self.assertEqual(checks[1]["stage"], "cheap")
+        self.assertEqual(stages, [
+            {"name": "cheap", "check_indices": [0, 1]},
+            {"name": "expensive", "check_indices": [2]},
+        ])
+
+    def test_plan_completeness_stays_in_single_stage(self):
+        task = {
+            "check_stages": [
+                {
+                    "name": "default",
+                    "checks": [
+                        {"name": "lint", "mode": "isolated"},
+                        {"name": "plan-completeness", "mode": "parallel"},
+                    ],
+                },
+            ],
+        }
+
+        checks, stages = dag.review_check_stages(task)
+
+        self.assertEqual([c["name"] for c in checks], ["lint", "plan-completeness"])
+        self.assertEqual(checks[1]["stage"], "default")
+        self.assertEqual(stages, [{"name": "default", "check_indices": [0, 1]}])
 
 
 class TestNextTaskId(unittest.TestCase):
@@ -281,6 +374,41 @@ class TestInsertGlobalPause(unittest.TestCase):
             # But work task 'c' should
             c = next(t for t in data["tasks"] if t["id"] == "c")
             self.assertIn(pause_id, c["depends_on"])
+        finally:
+            os.unlink(path)
+
+
+class TestInsertGitPreflightPause(unittest.TestCase):
+    def test_insert_no_branch_pause(self):
+        path = _make_tasks_file([
+            {"id": "a", "status": "done", "depends_on": [], "type": "work", "plan_source": ".ralpanda/plans/test.md"},
+            {"id": "b", "status": "pending", "depends_on": ["a"], "type": "work", "plan_source": ".ralpanda/plans/test.md"},
+        ])
+        try:
+            pause_id = dag.insert_no_branch_pause(path, "b")
+            with open(path) as f:
+                data = json.load(f)
+            tasks = data["tasks"]
+            self.assertEqual(len(tasks), 3)
+            self.assertEqual(tasks[1]["title"], "Pause (no git branch)")
+            self.assertEqual(tasks[1]["pause_reason"], "git branch required: checkout or create a branch before resuming")
+            self.assertIn(pause_id, tasks[2]["depends_on"])
+        finally:
+            os.unlink(path)
+
+    def test_no_duplicate_no_branch_pause(self):
+        path = _make_tasks_file([
+            {"id": "a", "status": "done", "depends_on": [], "type": "work", "plan_source": ".ralpanda/plans/test.md"},
+            {"id": "b", "status": "pending", "depends_on": ["a"], "type": "work", "plan_source": ".ralpanda/plans/test.md"},
+        ])
+        try:
+            first = dag.insert_no_branch_pause(path, "b")
+            self.assertIsNotNone(first)
+            second = dag.insert_no_branch_pause(path, "b")
+            self.assertIsNone(second)
+            with open(path) as f:
+                data = json.load(f)
+            self.assertEqual(len(data["tasks"]), 3)
         finally:
             os.unlink(path)
 

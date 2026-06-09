@@ -7,18 +7,29 @@ from __future__ import annotations
 
 import curses
 import json
-import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
+
+from . import dag
 
 
 # Task type -> (color_pair_id, icon)
 TYPE_DISPLAY = {
     "work":           (1, "w"),
     "review":         (2, "r"),
+    "review_compatibility": (2, "c"),
     "pause":          (3, "p"),
     "delete_base_sha": (5, "g"),
 }
+
+CHECK_TASK_TYPES = {"review", "review_compatibility"}
+UNKNOWN_LOG_TIME = "--:--:--"
+
+
+def is_check_task(task: dict | None) -> bool:
+    """Return True for tasks that render review/check subpanes."""
+    return bool(task and task.get("type") in CHECK_TASK_TYPES)
 
 # Status icons (overlaid on type color)
 STATUS_ICON = {
@@ -34,6 +45,7 @@ STATUS_ICON = {
 LOOP_STATE_LABEL = {
     "running":         "RUNNING",
     "paused":          "PAUSED",
+    "waiting_tasks":   "NO TASKS",
     "idle":            "IDLE",
     "waiting_done":    "ALL DONE",
     "waiting_blocked": "BLOCKED",
@@ -130,7 +142,7 @@ class TUIState:
     selected_idx: int = 0
     scroll_offset: int = 0
     detail_scroll: int = 0  # scroll offset for detail panel
-    log_lines: list[str] = field(default_factory=list)
+    log_lines: list[tuple[str, str]] = field(default_factory=list)
     log_file_pos: int = 0
     auto_follow: bool = True
     focus_panel: int = 0  # 0=task list, 1=detail/check list, 2=check log (review only)
@@ -146,7 +158,7 @@ class TUIState:
     # -- Review check panel state --
     selected_check_idx: int = 0
     check_detail_scroll: int = 0
-    check_log_lines: list = field(default_factory=list)
+    check_log_lines: list[tuple[str, str]] = field(default_factory=list)
     check_log_file_pos: int = 0
     _tailing_check_id: str = ""  # "{task_id}:{check_name}" to detect changes
 
@@ -213,9 +225,9 @@ class TUIState:
         self._render_task_list(loop_state, 0, content_y, left_width, content_height)
         self._render_divider(left_width, 0, status_y, focused=self.focus_panel in (0, 1))
 
-        # For review tasks, split the right pane into check list + check detail
+        # For review/check tasks, split the right pane into check list + detail
         selected = self._selected_task()
-        if selected and selected.get("type") == "review":
+        if is_check_task(selected):
             # Three-column: task list | check list | check detail/log
             mid_width = max(20, right_width * 2 // 5)
             far_x = right_x + mid_width + 1
@@ -243,7 +255,12 @@ class TUIState:
         display = self._display_list
 
         if not display:
-            self.safe_addstr(y, x, " No tasks loaded", curses.A_DIM, width)
+            if loop_state.tasks_file.exists():
+                lines = [" No tasks in tasks.json", " Waiting for tasks to be added"]
+            else:
+                lines = [" No tasks yet", f" Waiting for {loop_state.tasks_file}"]
+            for i, line in enumerate(lines[:height]):
+                self.safe_addstr(y + i, x, line, curses.A_DIM, width)
             return
 
         # Count actual tasks (not headers) for index clamping
@@ -390,7 +407,17 @@ class TUIState:
         """
         task = self._selected_task()
         if not task:
-            self.safe_addstr(y, x, " No task selected", curses.A_DIM, width)
+            if not loop_state.tasks:
+                lines = [
+                    (" No tasks yet", curses.A_BOLD),
+                    ("", 0),
+                    (f" Waiting for {loop_state.tasks_file}", curses.A_DIM),
+                    (" The loop will pick it up automatically.", curses.A_DIM),
+                ]
+                for i, (line, attr) in enumerate(lines[:height]):
+                    self.safe_addstr(y + i, x, line, attr, width)
+            else:
+                self.safe_addstr(y, x, " No task selected", curses.A_DIM, width)
             return
 
         task_id = task["id"]
@@ -458,6 +485,9 @@ class TUIState:
         lines.append((" Outcome:", curses.A_BOLD))
         if outcome and isinstance(outcome, dict):
             summary = outcome.get("summary", "")
+            payload = outcome.get("payload", {})
+            if not isinstance(payload, dict):
+                payload = {}
             if summary:
                 lines.append((" Summary:", curses.A_BOLD))
                 for wl in _wrap(summary, width - 3):
@@ -465,7 +495,7 @@ class TUIState:
             else:
                 lines.append(("  summary: (empty)", curses.A_DIM))
 
-            files = outcome.get("files_changed", [])
+            files = outcome.get("files_changed", payload.get("files_changed", []))
             lines.append((" Files:", curses.A_BOLD))
             if files:
                 for f in files[:10]:
@@ -473,7 +503,7 @@ class TUIState:
             else:
                 lines.append(("  (none)", curses.A_DIM))
 
-            decisions = outcome.get("decisions", [])
+            decisions = outcome.get("decisions", payload.get("decisions", []))
             lines.append((" Decisions:", curses.A_BOLD))
             if decisions:
                 for d in decisions[:5]:
@@ -524,7 +554,13 @@ class TUIState:
 
         # -- Log section (newest first) --
         log_path_str = _task_log_path_str(loop_state.ralpanda_dir, task_id)
-        lines.append((f" Agent log: {log_path_str}", curses.A_BOLD))
+        _append_wrapped_label_value(
+            lines,
+            " Agent log: ",
+            log_path_str,
+            curses.A_BOLD,
+            width,
+        )
         if self.log_lines:
             lines.append(("  (text + tool_use only, newest first)", curses.A_DIM))
             _render_log_lines(self.log_lines, lines, width)
@@ -545,16 +581,18 @@ class TUIState:
 
     def _render_check_list(self, loop_state, task: dict, x: int, y: int, width: int, height: int) -> None:
         """Render the check list for a review task (middle pane)."""
-        checks = task.get("checks", [])
+        checks = dag.review_checks(task)
         task_id = task["id"]
         status = task.get("status", "pending")
         outcome = task.get("outcome")
+        uses_coordinator = task.get("type") == "review"
 
-        # Build check entries: each check + coordinator at bottom
+        # Build check entries: each check, plus coordinator for normal reviews.
         entries: list[dict] = []
         for i, check in enumerate(checks):
             name = check.get("name", f"check-{i}")
             mode = check.get("mode", "isolated")
+            stage = check.get("stage")
 
             # Determine live status
             if outcome and isinstance(outcome, dict):
@@ -562,35 +600,47 @@ class TUIState:
                 cr = next((r for r in outcome.get("check_results", []) if r["name"] == name), None)
                 check_status = cr["status"] if cr else "unknown"
             elif status == "running":
-                # Infer from log file existence + verdict
-                check_status = _infer_check_status(loop_state.ralpanda_dir, task_id, name)
+                # Outcome files are authoritative; logs only indicate activity.
+                check_status = _infer_check_status(loop_state.ralpanda_dir, task, check)
             else:
                 check_status = "pending"
 
-            entries.append({"name": name, "mode": mode, "status": check_status, "is_coordinator": False})
+            entries.append({
+                "name": name,
+                "mode": mode,
+                "stage": stage,
+                "status": check_status,
+                "is_coordinator": False,
+            })
 
         # Coordinator entry
-        if outcome and isinstance(outcome, dict):
-            has_failures = any(r["status"] == "fail" for r in outcome.get("check_results", []))
-            coord_status = "done" if has_failures else "skipped"
-            # Check if coordinator log exists even if we think it's skipped
-            coord_log = _check_log_path(loop_state.ralpanda_dir, task_id, "coordinator")
-            if coord_log.exists() and coord_status == "skipped":
-                coord_status = "done"
-        elif status == "running":
-            coord_status = _infer_check_status(loop_state.ralpanda_dir, task_id, "coordinator")
-            if coord_status == "pending":
+        if uses_coordinator:
+            if outcome and isinstance(outcome, dict):
+                has_failures = any(r["status"] == "fail" for r in outcome.get("check_results", []))
+                coord_status = "done" if has_failures else "skipped"
+                # Check if coordinator log exists even if we think it's skipped
+                coord_log = _check_log_path(loop_state.ralpanda_dir, task_id, "coordinator")
+                if coord_log.exists() and coord_status == "skipped":
+                    coord_status = "done"
+            elif status == "running":
+                coord_status = _infer_coordinator_status(loop_state.ralpanda_dir, task)
+                if coord_status == "pending":
+                    coord_status = "waiting"
+            else:
                 coord_status = "waiting"
-        else:
-            coord_status = "waiting"
-        entries.append({"name": "coordinator", "mode": "", "status": coord_status, "is_coordinator": True})
+            entries.append({"name": "coordinator", "mode": "", "status": coord_status, "is_coordinator": True})
+
+        if not entries:
+            self.safe_addstr(y, x, " No checks configured", curses.A_DIM, width)
+            return
 
         # Clamp selected_check_idx
         self.selected_check_idx = max(0, min(self.selected_check_idx, len(entries) - 1))
 
         # Header
         dur = _fmt_duration(task)
-        header = f" Review: {task_id.split('/')[-1]}"
+        label = "Review" if uses_coordinator else "Compatibility"
+        header = f" {label}: {task_id.split('/')[-1]}"
         if dur:
             header += f"  ({dur})"
         self.safe_addstr(y, x, header[:width].ljust(width), curses.A_BOLD | curses.color_pair(2), width)
@@ -645,21 +695,27 @@ class TUIState:
                 label = f" {icon} ── coordinator ──"
             else:
                 mode_tag = f" [{entry['mode'][:1]}]" if entry["mode"] else ""
-                label = f" {icon} {name}{mode_tag}"
+                stage_tag = f"{entry['stage']}/" if entry.get("stage") else ""
+                label = f" {icon} {stage_tag}{name}{mode_tag}"
 
             attr = curses.A_REVERSE if is_sel else 0
             self.safe_addstr(row, x, label.ljust(width)[:width], color | attr, width)
 
     def _render_check_detail(self, loop_state, task: dict, x: int, y: int, width: int, height: int) -> None:
         """Render detail/log for the selected check (far right pane)."""
-        checks = task.get("checks", [])
+        checks = dag.review_checks(task)
         task_id = task["id"]
         outcome = task.get("outcome")
+        uses_coordinator = task.get("type") == "review"
+
+        if not checks:
+            self.safe_addstr(y, x, " No checks configured", curses.A_DIM, width)
+            return
 
         # Determine which entry is selected
-        entry_count = len(checks) + 1  # checks + coordinator
+        entry_count = len(checks) + (1 if uses_coordinator else 0)
         idx = max(0, min(self.selected_check_idx, entry_count - 1))
-        is_coordinator = (idx == len(checks))
+        is_coordinator = uses_coordinator and idx == len(checks)
 
         if is_coordinator:
             check_name = "coordinator"
@@ -679,9 +735,14 @@ class TUIState:
         if is_coordinator:
             lines.append((" Fix-up task generator", curses.A_DIM))
             # Status
+            coord_status = _infer_coordinator_status(loop_state.ralpanda_dir, task)
             coord_log = _check_log_path(loop_state.ralpanda_dir, task_id, "coordinator")
-            if coord_log.exists():
-                lines.append((" Status: ran", curses.color_pair(11)))
+            if coord_status in ("done", "tasks_created"):
+                lines.append((" Status: tasks created", curses.color_pair(11)))
+            elif coord_status == "infra_fail":
+                lines.append((" Status: INFRA_FAIL", curses.color_pair(12)))
+            elif coord_log.exists():
+                lines.append((" Status: running", curses.color_pair(2)))
             elif outcome:
                 has_failures = any(
                     r["status"] == "fail"
@@ -719,6 +780,29 @@ class TUIState:
                             lines.append((" Detail:", curses.A_BOLD))
                             for wl in _wrap(detail, width - 3):
                                 lines.append((f"  {wl}", curses.color_pair(12)))
+            else:
+                live_status, live_outcome = _live_check_outcome(
+                    loop_state.ralpanda_dir,
+                    task,
+                    check,
+                )
+                if live_status == "pass":
+                    lines.append((" Status: PASS", curses.color_pair(11)))
+                elif live_status == "fail":
+                    lines.append((" Status: FAIL", curses.color_pair(4)))
+                elif live_status == "infra_fail":
+                    lines.append((" Status: INFRA_FAIL", curses.color_pair(12)))
+                elif live_status == "running":
+                    lines.append((" Status: running", curses.color_pair(2)))
+                else:
+                    lines.append((" Status: pending", curses.A_DIM))
+                if live_outcome:
+                    summary = live_outcome.get("summary", "")
+                    if summary:
+                        lines.append(("", 0))
+                        lines.append((" Outcome summary:", curses.A_BOLD))
+                        for wl in _wrap(summary, width - 3):
+                            lines.append((f"  {wl}", 0))
 
             # Prompt
             if check_prompt:
@@ -733,7 +817,7 @@ class TUIState:
 
         # Log section
         log_path = _check_log_path(loop_state.ralpanda_dir, task_id, check_name)
-        lines.append((f" Log: {log_path}", curses.A_BOLD))
+        _append_wrapped_label_value(lines, " Log: ", str(log_path), curses.A_BOLD, width)
 
         if self.check_log_lines:
             lines.append(("  (newest first)", curses.A_DIM))
@@ -765,7 +849,7 @@ class TUIState:
         state = loop_state.state
         label = LOOP_STATE_LABEL.get(state, state.upper())
 
-        if state == "paused":
+        if state in ("paused", "waiting_tasks"):
             bar_attr = curses.color_pair(9) | curses.A_BOLD
         elif state == "running":
             bar_attr = curses.color_pair(8) | curses.A_BOLD
@@ -850,15 +934,17 @@ def _tail_log_file(
     if not new_data:
         return file_pos
 
-    for line in new_data.strip().split("\n"):
+    entries: list[dict] = []
+    for line in new_data.splitlines():
         if not line:
             continue
         try:
-            obj = json.loads(line)
+            entries.append(json.loads(line))
         except json.JSONDecodeError:
             continue
 
-        ts = time.strftime("%H:%M:%S")
+    entry_times = _infer_log_entry_times(entries)
+    for obj, ts in zip(entries, entry_times):
 
         msg = obj.get("message", {})
         for block in msg.get("content", []):
@@ -877,6 +963,72 @@ def _tail_log_file(
         del lines[:-1000]
 
     return file_pos
+
+
+def _log_entry_time(obj: dict) -> str:
+    """Return display time from a stream-json log entry's own timestamp."""
+    return _direct_log_entry_time(obj) or UNKNOWN_LOG_TIME
+
+
+def _direct_log_entry_time(obj: dict) -> str | None:
+    """Return a display time directly present on a stream-json log entry."""
+    for key in ("ts", "timestamp"):
+        value = obj.get(key)
+        if isinstance(value, str):
+            display_time = _format_log_timestamp(value)
+            if display_time:
+                return display_time
+    return None
+
+
+def _infer_log_entry_times(entries: list[dict]) -> list[str]:
+    """Infer display times for entries that lack their own timestamp.
+
+    Recent Claude stream-json logs put timestamps on user/tool-result records,
+    while the adjacent assistant text/tool-use records may omit them. Use the
+    nearest timestamped entry from the same batch so historical logs keep real
+    file-derived times without being stamped at read/render time.
+    """
+    direct_times = [_direct_log_entry_time(entry) for entry in entries]
+
+    next_times: list[str | None] = [None] * len(entries)
+    next_seen: str | None = None
+    for idx in range(len(entries) - 1, -1, -1):
+        if direct_times[idx]:
+            next_seen = direct_times[idx]
+        next_times[idx] = next_seen
+
+    inferred: list[str] = []
+    previous_seen: str | None = None
+    for idx, direct_time in enumerate(direct_times):
+        if direct_time:
+            previous_seen = direct_time
+            inferred.append(direct_time)
+            continue
+        inferred.append(next_times[idx] or previous_seen or UNKNOWN_LOG_TIME)
+
+    return inferred
+
+
+def _format_log_timestamp(value: str) -> str:
+    """Format supported log timestamp strings as HH:MM:SS."""
+    normalized = value.strip()
+    if not normalized:
+        return ""
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+
+    try:
+        return datetime.fromisoformat(normalized).strftime("%H:%M:%S")
+    except ValueError:
+        pass
+
+    # Last-resort support for timestamp-like strings with an ISO time portion.
+    if "T" in value:
+        time_part = value.split("T", 1)[1][:8]
+        if len(time_part) == 8 and time_part[2] == ":" and time_part[5] == ":":
+            return time_part
+    return ""
 
 
 def tail_log(tui_state: TUIState, ralpanda_dir: Path, task_id: str | None) -> None:
@@ -966,10 +1118,37 @@ def _render_log_lines(
                         lines.append((f" {indent}{wl}", 0))
 
 
+def _append_wrapped_label_value(
+    lines: list[tuple[str, int]],
+    label: str,
+    value: str,
+    attr: int,
+    width: int,
+) -> None:
+    """Append a label/value row, wrapping exact value text across display rows."""
+    if width <= 0:
+        return
+
+    if len(label) >= width:
+        for wrapped_line in _wrap(f"{label}{value}", width):
+            lines.append((wrapped_line, attr))
+        return
+
+    first_width = max(1, width - len(label))
+    lines.append((f"{label}{value[:first_width]}", attr))
+
+    indent_len = min(len(label), max(0, width - 1))
+    indent = " " * indent_len
+    cont_width = max(1, width - indent_len)
+    remaining = value[first_width:]
+    while remaining:
+        lines.append((f"{indent}{remaining[:cont_width]}", attr))
+        remaining = remaining[cont_width:]
+
+
 def _check_log_path(ralpanda_dir: Path, task_id: str, check_name: str) -> Path:
     """Return the log file path for a check subagent."""
-    safe_id = task_id.replace("/", "-")
-    return ralpanda_dir / "logs" / f"{safe_id}-{check_name}.jsonl"
+    return dag.task_log_path(ralpanda_dir, task_id, check_name)
 
 
 def _fmt_tokens(task: dict) -> str:
@@ -987,35 +1166,96 @@ def _fmt_tokens(task: dict) -> str:
     return f"{out}t"
 
 
-def _infer_check_status(ralpanda_dir: Path, task_id: str, check_name: str) -> str:
-    """Infer a check's live status from its log file.
+def _infer_check_status(ralpanda_dir: Path, task: dict, check: dict) -> str:
+    """Infer a check's live status from its outcome file.
 
     Returns: 'pending' | 'running' | 'pass' | 'fail' | 'infra_fail'
     """
-    log_path = _check_log_path(ralpanda_dir, task_id, check_name)
-    if not log_path.exists():
-        return "pending"
+    task_id = task["id"]
+    attempt = task.get("attempt", 1)
+    name = check.get("name", "check")
+    namespace = dag.review_agent_namespace(
+        task.get("type", "review"),
+        check.get("stage") or "checks",
+        name,
+    )
+    kind = dag.agent_kind_for_check_task(task.get("type", "review"))
+    outcome, error, _ = dag.read_valid_outcome(
+        ralpanda_dir,
+        task_id,
+        attempt,
+        namespace,
+        kind,
+    )
+    if outcome:
+        return outcome.get("status", "running")
 
-    # Read last few KB looking for a VERDICT line
-    try:
-        size = log_path.stat().st_size
-        with open(log_path, "r", errors="replace") as f:
-            if size > 8192:
-                f.seek(size - 8192)
-                f.readline()  # skip partial line
-            tail = f.read()
-    except OSError:
+    log_path = _check_log_path(ralpanda_dir, task_id, name)
+    if log_path.exists() and error:
         return "running"
+    return "pending"
 
-    for line in reversed(tail.split("\n")):
-        if "VERDICT: PASS" in line:
-            return "pass"
-        if "VERDICT: FAIL" in line:
-            return "fail"
-        if "VERDICT: INFRA_FAIL" in line:
-            return "infra_fail"
 
-    return "running"
+def _live_check_outcome(
+    ralpanda_dir: Path,
+    task: dict,
+    check: dict,
+) -> tuple[str, dict | None]:
+    """Return live check status plus the validated outcome when present."""
+    task_id = task["id"]
+    attempt = task.get("attempt", 1)
+    name = check.get("name", "check")
+    namespace = dag.review_agent_namespace(
+        task.get("type", "review"),
+        check.get("stage") or "checks",
+        name,
+    )
+    kind = dag.agent_kind_for_check_task(task.get("type", "review"))
+    outcome, error, _ = dag.read_valid_outcome(
+        ralpanda_dir,
+        task_id,
+        attempt,
+        namespace,
+        kind,
+    )
+    if outcome:
+        return outcome.get("status", "running"), outcome
+    if _check_log_path(ralpanda_dir, task_id, name).exists() and error:
+        return "running", None
+    return "pending", None
+
+
+def _infer_coordinator_status(ralpanda_dir: Path, task: dict) -> str:
+    """Infer coordinator status from coordinator outcome files."""
+    task_id = task["id"]
+    attempt = task.get("attempt", 1)
+    root = (
+        ralpanda_dir
+        / "outcomes"
+        / dag.task_safe_id(task_id)
+        / f"attempt-{attempt}"
+        / "coordinator"
+    )
+    if root.exists():
+        for path in sorted(root.glob("attempt-*.json"), reverse=True):
+            namespace = f"coordinator/{path.stem}"
+            outcome, _, _ = dag.read_valid_outcome(
+                ralpanda_dir,
+                task_id,
+                attempt,
+                namespace,
+                "coordinator",
+            )
+            if outcome:
+                status = outcome.get("status")
+                if status == "tasks_created":
+                    return "done"
+                if status == "infra_fail":
+                    return "infra_fail"
+
+    if _check_log_path(ralpanda_dir, task_id, "coordinator").exists():
+        return "running"
+    return "pending"
 
 
 def _task_log_path_str(ralpanda_dir: Path, task_id: str) -> str:
@@ -1091,6 +1331,16 @@ def _wrap(text: str, width: int) -> list[str]:
         words = paragraph.split()
         current = ""
         for word in words:
+            if len(word) > width:
+                if current:
+                    lines.append(current)
+                    current = ""
+                while len(word) > width:
+                    lines.append(word[:width])
+                    word = word[width:]
+                if word:
+                    current = word
+                continue
             if current and len(current) + 1 + len(word) > width:
                 lines.append(current)
                 current = word
@@ -1101,5 +1351,3 @@ def _wrap(text: str, width: int) -> list[str]:
         if current:
             lines.append(current)
     return lines
-
-

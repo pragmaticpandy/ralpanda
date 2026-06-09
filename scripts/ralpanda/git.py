@@ -18,6 +18,21 @@ def is_clean() -> bool:
     return result.stdout.strip() == ""
 
 
+def current_branch() -> str | None:
+    """Return the current git branch name, or None when HEAD is detached."""
+    result = subprocess.run(
+        ["git", "branch", "--show-current"],
+        capture_output=True, text=True,
+    )
+    branch = result.stdout.strip()
+    return branch or None
+
+
+def is_on_branch() -> bool:
+    """Check if git has a current branch that ralpanda can commit to."""
+    return current_branch() is not None
+
+
 def dirty_summary() -> str:
     """Return a short summary of what's dirty in the working tree."""
     result = subprocess.run(
@@ -66,8 +81,11 @@ def commit_task(tasks_file: Path, task_id: str) -> str | None:
     title = task.get("title", "completed task")
     outcome = task.get("outcome", {}) or {}
     summary = outcome.get("summary", "completed task")
-    files_list = outcome.get("files_changed", [])
-    decisions = outcome.get("decisions", [])
+    payload = outcome.get("payload", {})
+    if not isinstance(payload, dict):
+        payload = {}
+    files_list = outcome.get("files_changed", payload.get("files_changed", []))
+    decisions = outcome.get("decisions", payload.get("decisions", []))
 
     # Stage all changes
     subprocess.run(["git", "add", "-A"], capture_output=True, check=True)

@@ -51,24 +51,29 @@ If the user provided an argument or their intent is clear from context, skip the
 
    For each criterion they provide, capture a short description string that will be added verbatim to the task's `acceptance_criteria` array.
 
-3. **End-of-Plan Review Checks** — Ask the user:
+3. **End-of-Plan Review Stages** — Ask the user:
 
    > **What review checks should run once after all tasks are complete?**
    >
-   > These are separate from per-task criteria — they run as dedicated review agents at the end. For each check, give a short name and the command/prompt (e.g., name: "typecheck", prompt: "run `npm run typecheck` and report any errors with file paths and fixes").
+   > These are separate from per-task criteria — they run as dedicated review agents at the end. Checks can be grouped into ordered stages. If any check in a stage fails, later stages are skipped and the coordinator immediately creates remediation tasks from that failed stage.
+   >
+   > Put cheap or likely-to-fail checks in earlier stages, and expensive checks in later stages. For each stage, give a short stage name. For each check, give a unique short check name and the command/prompt (e.g., name: "typecheck", prompt: "run `npm run typecheck` and report any errors with file paths and fixes").
    >
    > Say "none" to skip, or I can explore the codebase and suggest checks.
 
    Do NOT suggest specific checks upfront. Only offer to explore and suggest if the user asks for help.
 
    For each check, get:
-   - A short name (e.g., "typecheck", "lint", "tests")
+   - A short unique name (e.g., "typecheck", "lint", "tests")
    - The specific prompt for the review agent (should include the command to run AND instructions for what to report if it fails — specifically: what files need to change, what the fix is, etc.)
    - The execution mode: ask whether this check needs to run builds/tests (`"isolated"` — runs alone, one at a time) or only reads code (`"parallel"` — runs concurrently with other parallel checks). Parallel checks get an auto-injected constraint forbidding builds/tests.
+   - Optional pre-plan compatibility: for review checks that encode architectural assumptions, required patterns, API boundaries, or similar code-review rules, ask whether the user wants a pre-plan compatibility check. These run before work starts and verify that the review check itself is compatible with the plan. If yes, capture a `pre_plan_compatibility` object with a prompt and mode. Default the compatibility mode to `"parallel"` unless the user has a specific reason it must run alone.
+
+   If the user does not care about stages, create a single stage named `"default"` containing all checks.
 
 4. **Model** — Ask the user which Claude model to use for agent iterations. Default is `opus[1m]`. They can change this later in config.json.
 
-5. **Wait for the user to confirm** the per-task acceptance criteria, review checks, and model before writing config. When presenting the confirmation summary, also mention that a **plan-completeness check** will be automatically added to every review task — this check reads the plan file and tasks.json to verify that every requirement in the plan has been addressed by at least one completed task. Do NOT proceed until they've approved everything.
+5. **Wait for the user to confirm** the per-task acceptance criteria, ordered review stages, optional pre-plan compatibility checks, and model before writing config. When presenting the confirmation summary, also mention that a **plan-completeness check** will be automatically added to every review task — this check reads the plan file, uses `base_sha` to compare HEAD against the start of the plan, and explores the code on disk at HEAD as needed to confirm all parts of the plan were implemented. If the end-of-plan review uses multiple stages, this check is added to the first stage so missing or partial plan coverage can stop later stages early. Do NOT proceed until they've approved everything.
 
 6. Write `.ralpanda/config.json`:
    ```json
@@ -78,11 +83,31 @@ If the user provided an argument or their intent is clear from context, skip the
        "npm run typecheck passes with no errors",
        "npm test passes"
      ],
-     "review_checks": [
-       {"name": "...", "prompt": "...", "mode": "isolated"},
-       ...
+     "review_check_stages": [
+       {
+         "name": "cheap",
+         "checks": [
+           {"name": "typecheck", "prompt": "Run `npm run typecheck` and report any type errors with file paths and suggested fixes.", "mode": "isolated"}
+         ]
+       },
+       {
+         "name": "expensive",
+         "checks": [
+           {
+             "name": "uses-pattern-y",
+             "prompt": "At end of plan, verify that situation X uses pattern Y...",
+             "mode": "parallel",
+             "pre_plan_compatibility": {
+               "prompt": "Before work starts, read the plan and generated tasks. Determine whether this review check remains valid for the plan. PASS if the plan can be implemented while still satisfying the review check. FAIL if the plan contradicts, obsoletes, or makes pattern Y unusable or ambiguous. On failure, say whether the plan, the review check, or both should change.",
+               "mode": "parallel"
+             }
+           }
+         ]
+       }
      ],
-     "max_attempts_per_task": 3
+     "max_attempts_per_task": 3,
+     "coordinator_max_attempts": 3,
+     "coordinator_max_turns": 3
    }
    ```
 
@@ -91,6 +116,12 @@ If the user provided an argument or their intent is clear from context, skip the
    - `"parallel"` — only reviews code by reading files and analyzing. These checks run **all at once**, concurrently. The review script auto-injects a strict constraint telling the agent it MUST NOT run builds, tests, compilers, linters, or formatters — only read/search/analyze.
 
    Default to `"isolated"` if the user doesn't specify. When asking the user about review checks, also ask whether each check needs to run builds/tests (isolated) or just reads code (parallel).
+
+   Review stages run in the order listed. Inside each stage, parallel checks launch together first, then isolated checks run one at a time. After each stage completes, any `FAIL` or `INFRA_FAIL` short-circuits the remaining stages. `FAIL` runs the coordinator immediately to create fix-up tasks from that stage's failed checks; the coordinator gets a bounded retry budget from `coordinator_max_attempts` and `coordinator_max_turns`. If it still cannot produce valid fix-up tasks, the loop inserts a pause plus a cloned review instead of silently rerunning the same review. `INFRA_FAIL` inserts the usual pause and cloned review.
+
+   Backwards compatibility: existing configs with a flat `review_checks` array still work as a single implicit stage, but new configs should prefer `review_check_stages`.
+
+   `pre_plan_compatibility` is optional. Use it only for review checks whose validity could be changed by the plan itself. Do not add it to mechanical checks like typecheck, lint, test commands, or the automatic plan-completeness check unless the user explicitly asks.
 
 7. Add `.ralpanda/` to the **global** gitignore (so it's excluded from every project without polluting each repo's `.gitignore`):
    ```bash
@@ -136,7 +167,7 @@ Before decomposing, check whether the diff baseline needs to be set or reset. Re
   > 1. **Keep the current baseline** — new tasks' reviews will cover all changes since the original base_sha (including prior tasks' work)
   > 2. **Insert a `delete_base_sha` gate** — a fresh baseline will be auto-captured when the next work task runs, so their review will only cover changes from that point forward
 
-  If they choose option 2, insert a `delete_base_sha` task during decomposition (see rule 5 below). New work tasks should depend on it.
+  If they choose option 2, insert a `delete_base_sha` task during decomposition (see `delete_base_sha` gate tasks below). New work tasks should depend on it.
 
 ### Decompose Into Tasks
 
@@ -162,7 +193,7 @@ Analyze the plan and break it into atomic work tasks. Each task must be completa
      - Example: `ralpanda/add-user-auth/001`, `ralpanda/add-user-auth/002`
      - For gate tasks (delete_base_sha, pause) without a plan, use `ralpanda/_gate/<NNN>`
    - `title`: Short imperative title
-   - `type`: "work" | "review" | "delete_base_sha" | "pause"
+   - `type`: "work" | "review_compatibility" | "review" | "delete_base_sha" | "pause"
    - `status`: "pending"
    - `depends_on`: Array of task IDs that must complete first
    - `plan_source`: PLAN_PATH (the specific plan file for this set of tasks)
@@ -174,9 +205,52 @@ Analyze the plan and break it into atomic work tasks. Each task must be completa
    - `started_at`: null
    - `completed_at`: null
 
-4. **One review task at the end**: This depends on ALL work tasks. The title should be generic (not plan-specific). The review task **must** include a `checks` array — this is what the review orchestrator reads to run checks. Copy the `review_checks` from `.ralpanda/config.json` into the task's `checks` array, then append a plan-completeness check that references the specific `PLAN_PATH`. The `description` field is a human-readable summary only.
+4. **Optional pre-plan review compatibility task**: If any configured review checks in any stage have `pre_plan_compatibility`, add one `review_compatibility` task before the work tasks. This task checks whether the end-of-plan review checks themselves are compatible with the plan about to be implemented.
 
-   Example — if config.json has typecheck and lint checks, and PLAN_PATH is `.ralpanda/plans/add-user-auth.md`:
+   The compatibility task should depend on the same external/root dependencies as the plan's root work tasks would have depended on (for example, an inserted `delete_base_sha` gate or prior plan cleanup). Then every root work task for this plan must depend on the compatibility task, so no implementation starts until compatibility passes.
+
+   The compatibility task **must** include a `checks` array. For each configured review check in any stage with `pre_plan_compatibility`, add one compatibility check:
+   - `name`: `compat-<review-check-name>` (keep it filesystem-friendly; avoid slashes)
+   - `prompt`: the `pre_plan_compatibility.prompt`
+   - `mode`: the `pre_plan_compatibility.mode`, defaulting to `"parallel"`
+   - `for_review_check`: the original review check's `name`
+   - `review_prompt`: the original review check's `prompt`
+
+   If the compatibility task reports any `FAIL` or `INFRA_FAIL`, the loop writes the violations into the task outcome, inserts a `pause`, clones the compatibility task, and rewires downstream work to depend on the cloned gate. The user can then fix the plan, the review check, or both, and resume.
+
+   Example:
+   ```json
+   {
+     "id": "ralpanda/add-user-auth/001",
+     "title": "Check review compatibility with plan",
+     "type": "review_compatibility",
+     "status": "pending",
+     "depends_on": [],
+     "plan_source": ".ralpanda/plans/add-user-auth.md",
+     "target_review_task_id": "ralpanda/add-user-auth/005",
+     "description": "Verify configured end-of-plan review checks are compatible with this plan before implementation starts.",
+     "checks": [
+       {
+         "name": "compat-uses-pattern-y",
+         "prompt": "Before work starts, read the plan and generated tasks. Determine whether this review check remains valid for the plan. PASS if the plan can be implemented while still satisfying the review check. FAIL if the plan contradicts, obsoletes, or makes pattern Y unusable or ambiguous. On failure, say whether the plan, the review check, or both should change.",
+         "mode": "parallel",
+         "for_review_check": "uses-pattern-y",
+         "review_prompt": "At end of plan, verify that situation X uses pattern Y..."
+       }
+     ],
+     "acceptance_criteria": [
+       "All review compatibility checks pass"
+     ],
+     "outcome": null,
+     "attempt": 0
+   }
+   ```
+
+   Do not create this task when no review checks define `pre_plan_compatibility`.
+
+5. **One review task at the end**: This depends on ALL work tasks. The title should be generic (not plan-specific). The review task **must** include a `check_stages` array — this is what the review orchestrator reads to run ordered review stages. Copy the configured `review_check_stages` from `.ralpanda/config.json` into the task's `check_stages` array using each stage's `name` and each check's `name`, `prompt`, and `mode` fields. If the config only has the legacy flat `review_checks` array, wrap those checks in one stage named `"default"`. Then add a plan-completeness check that references the specific `PLAN_PATH`. If the review has multiple stages, append plan-completeness to the first stage. If the review has exactly one stage, append it to that stage. The `description` field is a human-readable summary only.
+
+   Example — if config.json has a cheap typecheck stage and an expensive lint stage, and PLAN_PATH is `.ralpanda/plans/add-user-auth.md`:
    ```json
    {
      "id": "ralpanda/add-user-auth/005",
@@ -186,10 +260,20 @@ Analyze the plan and break it into atomic work tasks. Each task must be completa
      "depends_on": ["<all work task IDs>"],
      "plan_source": ".ralpanda/plans/add-user-auth.md",
      "description": "Run all configured review checks and verify plan completeness.",
-     "checks": [
-       {"name": "typecheck", "prompt": "Run `npm run typecheck` and report any type errors with file paths and suggested fixes.", "mode": "isolated"},
-       {"name": "lint", "prompt": "Run `npm run lint` and report any lint errors with file paths and suggested fixes.", "mode": "isolated"},
-       {"name": "plan-completeness", "prompt": "Read .ralpanda/plans/add-user-auth.md and .ralpanda/tasks.json. Verify that every requirement in the plan has been addressed by at least one completed task. List any requirements that appear unimplemented or only partially implemented, and describe what work remains for each.", "mode": "parallel"}
+     "check_stages": [
+       {
+         "name": "cheap",
+         "checks": [
+           {"name": "typecheck", "prompt": "Run `npm run typecheck` and report any type errors with file paths and suggested fixes.", "mode": "isolated"},
+           {"name": "plan-completeness", "prompt": "Read .ralpanda/plans/add-user-auth.md. Use base_sha to compare HEAD against the start of the plan, and explore the code on disk at HEAD as needed, to confirm that all parts of the written plan were implemented. Report anything missing or only partially implemented relative to the plan.", "mode": "parallel"}
+         ]
+       },
+       {
+         "name": "expensive",
+         "checks": [
+           {"name": "lint", "prompt": "Run `npm run lint` and report any lint errors with file paths and suggested fixes.", "mode": "isolated"}
+         ]
+       }
      ],
      "acceptance_criteria": [
        "All review checks pass",
@@ -200,12 +284,14 @@ Analyze the plan and break it into atomic work tasks. Each task must be completa
    }
    ```
 
-   Copy the `mode` field from each check in config.json. The plan-completeness check is always appended with `"mode": "parallel"` since it only reads files.
+   Copy the `mode` field from each check in config.json. Stage names and check names should be filesystem-friendly; check names must be unique across all stages because they are used for log file names. The plan-completeness check is always added with `"mode": "parallel"` since it only reads files and git diff output.
 
-   The plan-completeness check is always appended as the final entry in the `checks` array, referencing the specific plan file, with `"mode": "parallel"`:
-   > `{"name": "plan-completeness", "prompt": "Read <PLAN_PATH> and .ralpanda/tasks.json. Verify that every requirement in the plan has been addressed by at least one completed task. List any requirements that appear unimplemented or only partially implemented, and describe what work remains for each.", "mode": "parallel"}`
+   The plan-completeness check always references the specific plan file. If there are multiple configured review stages, append plan-completeness as the final check in the first stage so an incomplete plan can short-circuit later stages. If there is exactly one configured or legacy stage, append it to that stage. If there are no configured review stages, create a single `"final"` stage containing just plan-completeness:
+   > `{"name": "plan-completeness", "prompt": "Read <PLAN_PATH>. Use base_sha to compare HEAD against the start of the plan, and explore the code on disk at HEAD as needed, to confirm that all parts of the written plan were implemented. Report anything missing or only partially implemented relative to the plan.", "mode": "parallel"}`
 
-5. **`delete_base_sha` gate tasks**: Add a `delete_base_sha` task after every review. This removes the diff baseline file so that when the next plan's first work task runs, a fresh baseline is auto-captured. When orchestrating multiple sequential plans, the pattern is: Plan A work → Plan A review → `delete_base_sha` → Plan B work (auto-captures new baseline) → Plan B review → `delete_base_sha`. The user can move these tasks around in the DAG for complex scenarios. It runs instantly (no agent spawned).
+   Backwards compatibility: a review task with a flat `checks` array is treated as one implicit stage. New review tasks should use `check_stages`.
+
+6. **`delete_base_sha` gate tasks**: Add a `delete_base_sha` task after every review. This removes the diff baseline file so that when the next plan's first work task runs, a fresh baseline is auto-captured. When orchestrating multiple sequential plans, the pattern is: Plan A work → Plan A review → `delete_base_sha` → Plan B work (auto-captures new baseline) → Plan B review → `delete_base_sha`. The user can move these tasks around in the DAG for complex scenarios. It runs instantly (no agent spawned).
 
    Example — review task is `ralpanda/add-user-auth/005`:
    ```json
@@ -223,7 +309,7 @@ Analyze the plan and break it into atomic work tasks. Each task must be completa
    }
    ```
 
-6. **`pause` gate tasks**: A `pause` task pauses the loop when reached and waits for a resume sentinel. The user can insert pause tasks anywhere in the DAG — for example, between phases to inspect intermediate results, or before a review to manually verify changes. The loop will set its state to "paused" and poll for a resume sentinel. It runs instantly (no agent spawned). Pauses can also be inserted from the TUI with the `p` key.
+7. **`pause` gate tasks**: A `pause` task pauses the loop when reached and waits for a resume sentinel. The user can insert pause tasks anywhere in the DAG — for example, between phases to inspect intermediate results, or before a review to manually verify changes. The loop will set its state to "paused" and poll for a resume sentinel. It runs instantly (no agent spawned). Pauses can also be inserted from the TUI with the `p` key.
 
    Example:
    ```json
@@ -241,13 +327,13 @@ Analyze the plan and break it into atomic work tasks. Each task must be completa
    }
    ```
 
-7. **Context carries forward**: Later task descriptions can reference what earlier tasks should have accomplished, but shouldn't assume specific implementation details.
+8. **Context carries forward**: Later task descriptions can reference what earlier tasks should have accomplished, but shouldn't assume specific implementation details.
 
-8. **Task-specific verification**: For each work task, suggest any task-specific verification steps beyond the default review checks (e.g., "manually test the login flow", "verify the migration is reversible", "check the API response shape matches the spec"). Add these to the task's `acceptance_criteria`.
+9. **Task-specific verification**: For each work task, suggest any task-specific verification steps beyond the default review checks (e.g., "manually test the login flow", "verify the migration is reversible", "check the API response shape matches the spec"). Add these to the task's `acceptance_criteria`.
 
-9. **Cross-plan dependencies**: When the new plan is independent from existing tasks (i.e., not extending or building on prior work), all root tasks of the new plan — those with no intra-plan dependencies — must depend on every `delete_base_sha` task currently in tasks.json. This ensures prior plans' cleanup completes and the diff baseline is properly reset before the new plan's work begins. If there are no existing `delete_base_sha` tasks, no extra dependencies are needed.
+10. **Cross-plan dependencies**: When the new plan is independent from existing tasks (i.e., not extending or building on prior work), all root tasks of the new plan — those with no intra-plan dependencies — must depend on every `delete_base_sha` task currently in tasks.json. This ensures prior plans' cleanup completes and the diff baseline is properly reset before the new plan's work begins. If there are no existing `delete_base_sha` tasks, no extra dependencies are needed.
 
-10. **Present the full task list to the user for confirmation** before writing. Show each task with its title, dependencies, description summary, and acceptance criteria (including any task-specific verification). Ask the user to approve, reorder, merge, split, or modify tasks. Do NOT write `tasks.json` until they confirm.
+11. **Present the full task list to the user for confirmation** before writing. Show each task with its title, dependencies, description summary, and acceptance criteria (including any task-specific verification). Ask the user to approve, reorder, merge, split, or modify tasks. Do NOT write `tasks.json` until they confirm.
 
 ### Validate and Write
 
@@ -267,16 +353,17 @@ Analyze the plan and break it into atomic work tasks. Each task must be completa
 ### Print Summary
 
 Show the user:
-- Total task count (N work + 1 review + 1 delete_base_sha)
+- Total task count (N work + optional 1 review_compatibility + 1 review + 1 delete_base_sha)
 - DAG depth (longest dependency chain)
 - Task list with IDs, titles, and dependencies:
   ```
-  ralpanda/add-user-auth/001  Add User model and migration          (no deps)
-  ralpanda/add-user-auth/002  Create auth middleware                  -> .../001
-  ralpanda/add-user-auth/003  Add login/register API endpoints       -> .../001, .../002
-  ralpanda/add-user-auth/004  Add session management                 -> .../003
-  ralpanda/add-user-auth/005  Review: run all checks                 -> .../001–004
-  ralpanda/add-user-auth/006  Delete base SHA                        -> .../005
+  ralpanda/add-user-auth/001  Check review compatibility with plan  (no deps)
+  ralpanda/add-user-auth/002  Add User model and migration          -> .../001
+  ralpanda/add-user-auth/003  Create auth middleware                -> .../002
+  ralpanda/add-user-auth/004  Add login/register API endpoints      -> .../002, .../003
+  ralpanda/add-user-auth/005  Add session management                -> .../004
+  ralpanda/add-user-auth/006  Review: run all checks                -> .../002–005
+  ralpanda/add-user-auth/007  Delete base SHA                       -> .../006
   ```
 
 Tell them to start the loop by running the script directly in their terminal:
@@ -284,6 +371,26 @@ Tell them to start the loop by running the script directly in their terminal:
 SKILL_DIR/scripts/ralpanda-loop
 ```
 (Use the actual resolved absolute path.)
+
+---
+
+## Global Hooks
+
+The loop runs user-level hooks from:
+```
+${XDG_CONFIG_HOME:-~/.config}/ralpanda/hooks/<event>/
+```
+
+Supported first-pass events:
+- `task.finished` - a non-pause task reached a final status (`done`, `split`, or `failed`)
+- `loop.paused` - the loop reached a pause task and is waiting for resume
+- `loop.completed` - every task is complete
+
+Every hook payload includes a shared `loop` object with `state`, `state_info`, `current_task_id`, `next_task_id`, `counts`, and `total_tasks`. Task-specific information lives under `task`; for example, `task.status` is the finished task result and `task.pause_reason` is the pause reason.
+
+Hook scripts are executable regular files in the event directory. They run in lexical order from the project root. The loop sends event JSON on stdin and also sets convenience environment variables such as `RALPANDA_EVENT`, `RALPANDA_TASK_ID`, `RALPANDA_TASK_TYPE`, `RALPANDA_TASK_TITLE`, `RALPANDA_TASK_RESULT` (from `task.status`), `RALPANDA_PAUSE_REASON` (from `task.pause_reason`), and `RALPANDA_COMMIT_SHA`.
+
+Hook stdout/stderr is written to `.ralpanda/logs/hooks/<event>/`. Hook failures are logged to `.ralpanda/history.jsonl` and do not stop the loop.
 
 ---
 
@@ -299,6 +406,7 @@ Read the current state:
 3. **Validate the loop PID** — if `loop.state` says "running" or "paused":
    a. Read `.ralpanda/loop.pid`. If the file is missing, the loop is dead.
    b. Check if the PID is alive **and** is actually the loop process:
+      **Codex sandbox warning**: If you are running this skill as Codex, run this process check outside the Codex sandbox. Sandboxed `ps`, `pgrep`, `kill -0`, or similar process-inspection commands can give misleading results and make a live loop look dead. Read state files normally, but do not clean up state solely from sandboxed process output.
       ```bash
       kill -0 $(cat .ralpanda/loop.pid) 2>/dev/null && ps -p $(cat .ralpanda/loop.pid) -o command= | grep -q ralpanda
       ```
@@ -495,6 +603,7 @@ If the task has review sub-logs (e.g., `<task_id>-typecheck.jsonl`), summarize t
 ## General Rules
 
 - **Always re-read state before every action.** Never assume state from a previous turn is still valid. The loop can restart, tasks can finish, and PIDs can change between turns. This is the single most important rule — violating it leads to stale assumptions and wrong answers.
+- **Codex process checks must be unsandboxed.** If running as Codex, run `ps`, `pgrep`, `kill -0`, or similar process-inspection commands outside the Codex sandbox when investigating loop state; sandboxed output can be misleading.
 - Always validate task integrity (no duplicate IDs + no DAG cycles) after any modification to tasks.json.
 - **Always use the Locked Write Protocol** when modifying tasks.json (see below).
 - Be concise in status reports. Use a table format when listing tasks.
@@ -544,4 +653,4 @@ with locked_tasks(Path('.ralpanda/tasks.json')) as data:
 
 The lock is held only for the read-modify-write window (milliseconds). This is safe to use while the loop is running — the loop uses the same locking protocol.
 
-**Important**: The spawned claude agent iterations NEVER read or write tasks.json. They write their outcomes to `.ralpanda/outcomes/<task_id>.json` and the loop merges the outcome into tasks.json after the agent exits. This eliminates the primary source of write contention.
+**Important**: The spawned claude agent iterations NEVER read or write tasks.json. They write attempt-scoped outcome envelopes to `.ralpanda/outcomes/<safe-task-id>/attempt-<n>/<namespace>.json` (for example, `.ralpanda/outcomes/ralpanda-add-user-auth-001/attempt-1/work.json`). The loop validates the outcome envelope (`schema_version`, `task_id`, `attempt`, `agent.kind`, `agent.namespace`, `status`, `summary`, and `payload`) before merging it into tasks.json after the agent exits. This eliminates the primary source of write contention.

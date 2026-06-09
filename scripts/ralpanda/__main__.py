@@ -9,7 +9,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import dag, agent, git, prompt, tui
+from . import dag, agent, git, hooks, prompt, tui
 
 
 @dataclass
@@ -21,7 +21,7 @@ class LoopState:
     config: dict
     tasks: list[dict] = field(default_factory=list)
     tasks_mtime: float = 0.0
-    state: str = "running"  # running | paused | waiting_done | waiting_blocked
+    state: str = "running"  # running | paused | waiting_tasks | waiting_done | waiting_blocked
     state_info: str = ""    # human-readable context for current state, always set via set_state
     current_task_id: str | None = None
     agent_proc: object | None = None  # subprocess.Popen
@@ -33,7 +33,7 @@ class LoopState:
     exit_reason: str | None = None
 
     # States that must always carry an explanation
-    _REQUIRES_INFO = frozenset({"waiting_blocked", "waiting_done", "paused", "idle"})
+    _REQUIRES_INFO = frozenset({"waiting_tasks", "waiting_blocked", "waiting_done", "paused", "idle"})
 
     def set_state(self, state: str, info: str = "") -> None:
         """Set loop state with required context info.
@@ -60,13 +60,16 @@ class LoopState:
             self.tasks = data.get("tasks", [])
             self.tasks_mtime = self.tasks_file.stat().st_mtime
         except (FileNotFoundError, OSError):
-            pass
+            self.tasks = []
+            self.tasks_mtime = 0.0
 
     def maybe_reload_tasks(self) -> None:
         """Reload tasks if the file has been modified externally."""
         try:
             mtime = self.tasks_file.stat().st_mtime
         except (FileNotFoundError, OSError):
+            if self.tasks or self.tasks_mtime:
+                self.reload_tasks()
             return
         if mtime != self.tasks_mtime:
             self.reload_tasks()
@@ -85,25 +88,117 @@ def load_config(ralpanda_dir: Path) -> dict:
             pass
     config.setdefault("model", "opus[1m]")
     config.setdefault("max_attempts_per_task", 3)
+    config.setdefault(
+        "coordinator_max_attempts", agent.COORDINATOR_DEFAULT_MAX_ATTEMPTS,
+    )
+    config.setdefault(
+        "coordinator_max_turns", agent.COORDINATOR_DEFAULT_MAX_TURNS,
+    )
     return config
 
 
 def validate_startup(loop_state: LoopState) -> str | None:
     """Run startup checks. Returns error message or None if OK."""
     if not loop_state.tasks_file.exists():
-        return f"{loop_state.tasks_file} not found. Run /ralpanda first to set up."
+        loop_state.reload_tasks()
+        loop_state.set_state("waiting_tasks", f"waiting for {loop_state.tasks_file}")
+        return None
 
     loop_state.reload_tasks()
 
-    # Reset any stale "running" tasks from a previous crashed loop
-    stale_count = 0
+    if not loop_state.tasks:
+        loop_state.set_state("waiting_tasks", f"{loop_state.tasks_file} has no tasks")
+        return None
+
+    # Recover or reset any stale "running" tasks from a previous crashed loop.
     for t in loop_state.tasks:
         if t["status"] == "running":
-            dag.update_task_status(loop_state.tasks_file, t["id"], "pending")
-            stale_count += 1
-    if stale_count:
+            attempt = t.get("attempt", 1)
+            terminated = agent.terminate_running_metadata_for_task(
+                loop_state.ralpanda_dir,
+                t["id"],
+                attempt,
+                loop_state.history_file,
+                reason="startup_recovery",
+            )
+            if not terminated:
+                return _unsafe_startup_process_error(t)
+
+            if _recover_startup_running_task(loop_state, t):
+                dag.log_event(
+                    loop_state.history_file,
+                    "startup_recovered_running_task",
+                    t["id"],
+                )
+            else:
+                dag.update_task_status(loop_state.tasks_file, t["id"], "pending")
+                dag.log_event(
+                    loop_state.history_file,
+                    "startup_reset_running_task",
+                    t["id"],
+                    f"attempt={attempt}",
+                )
+    if any(t["status"] == "running" for t in loop_state.tasks):
         loop_state.reload_tasks()
 
+    return validate_loaded_tasks(loop_state)
+
+
+def _unsafe_startup_process_error(task: dict) -> str:
+    """Explain why startup recovery refused to signal a recorded process."""
+    task_id = task.get("id", "<unknown>")
+    attempt = task.get("attempt", 1)
+    return (
+        "startup recovery refused to kill a recorded agent process for "
+        f"{task_id} attempt {attempt} because it could not verify the PID/PGID "
+        "still belongs to the original Claude process. Inspect the metadata "
+        "under .ralpanda/running before retrying."
+    )
+
+
+def _recover_startup_running_task(loop_state: LoopState, task: dict) -> bool:
+    """Finish a stale running task if current-attempt outcomes are complete."""
+    task_id = task["id"]
+    task_type = task.get("type", "work")
+    attempt = task.get("attempt", 1)
+
+    if task_type == "work":
+        namespace = dag.work_agent_namespace()
+        outcome, error, _ = agent.collect_expected_outcome(
+            loop_state.ralpanda_dir,
+            task_id,
+            attempt,
+            namespace,
+            "work",
+        )
+        if error or not outcome:
+            return False
+        agent.process_work_result(
+            loop_state.ralpanda_dir,
+            loop_state.tasks_file,
+            task_id,
+            0,
+            loop_state.max_attempts,
+            loop_state.history_file,
+        )
+        return True
+
+    if task_type in ("review", "review_compatibility"):
+        recovered = agent.recover_review_task_from_outcomes(
+            loop_state.ralpanda_dir,
+            loop_state.tasks_file,
+            task_id,
+            loop_state.history_file,
+        )
+        if recovered:
+            dag.update_task_status(loop_state.tasks_file, task_id, "done")
+        return recovered
+
+    return False
+
+
+def validate_loaded_tasks(loop_state: LoopState) -> str | None:
+    """Validate the currently loaded non-empty task list."""
     # Validate plan_source files exist
     seen_sources = set()
     for t in loop_state.tasks:
@@ -130,9 +225,9 @@ def handle_input(key: int, tui_state: tui.TUIState, loop_state: LoopState) -> No
     tasks = loop_state.tasks
     task_count = sum(1 for item in tui_state._display_list if not isinstance(item, str))
 
-    # Determine max panels: 3 if selected task is a review, else 2
+    # Determine max panels: 3 if selected task has review-style checks, else 2
     selected = tui_state._selected_task()
-    is_review = selected and selected.get("type") == "review"
+    is_review = tui.is_check_task(selected)
     max_panels = 3 if is_review else 2
 
     if key == curses.KEY_RIGHT:
@@ -169,8 +264,11 @@ def handle_input(key: int, tui_state: tui.TUIState, loop_state: LoopState) -> No
     elif key == curses.KEY_DOWN:
         if tui_state.focus_panel == 1 and is_review:
             # Navigate check list (count includes coordinator entry)
-            check_count = len(selected.get("checks", [])) + 1  # +1 for coordinator
-            tui_state.selected_check_idx = min(check_count - 1, tui_state.selected_check_idx + 1)
+            check_count = len(dag.review_checks(selected))
+            if selected.get("type") == "review":
+                check_count += 1  # +1 for coordinator
+            if check_count:
+                tui_state.selected_check_idx = min(check_count - 1, tui_state.selected_check_idx + 1)
             tui_state.check_detail_scroll = 0
             tui_state._tailing_check_id = ""  # force log reload
         elif tui_state.focus_panel == 1:
@@ -203,14 +301,15 @@ def handle_input(key: int, tui_state: tui.TUIState, loop_state: LoopState) -> No
     elif key == ord("p"):
         # Insert pause before selected task only
         selected = tui_state._selected_task()
-        if selected and selected["status"] == "pending":
+        if loop_state.tasks_file.exists() and selected and selected["status"] == "pending":
             dag.insert_pause_before(loop_state.tasks_file, selected["id"])
             loop_state.reload_tasks()
 
     elif key == ord("P"):
         # Insert global pause (blocks all pending tasks)
-        dag.insert_global_pause(loop_state.tasks_file)
-        loop_state.reload_tasks()
+        if loop_state.tasks_file.exists() and loop_state.tasks:
+            dag.insert_global_pause(loop_state.tasks_file)
+            loop_state.reload_tasks()
 
     elif key == ord("r"):
         # Resume
@@ -232,12 +331,13 @@ def handle_input(key: int, tui_state: tui.TUIState, loop_state: LoopState) -> No
 
     elif key == ord("c"):
         # Clear tasks from fully-done plans
-        removed = dag.clear_done_plans(loop_state.tasks_file)
-        if removed:
-            loop_state.reload_tasks()
-            tui_state.selected_idx = 0
-            tui_state._selected_task_id = ""
-            tui_state.detail_scroll = 0
+        if loop_state.tasks_file.exists():
+            removed = dag.clear_done_plans(loop_state.tasks_file)
+            if removed:
+                loop_state.reload_tasks()
+                tui_state.selected_idx = 0
+                tui_state._selected_task_id = ""
+                tui_state.detail_scroll = 0
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +357,19 @@ def advance_loop(loop_state: LoopState, tui_state: tui.TUIState) -> None:
         dag.log_event(loop_state.history_file, "loop_exit_sentinel")
         return
 
+    if not loop_state.tasks_file.exists():
+        loop_state.set_state("waiting_tasks", f"waiting for {loop_state.tasks_file}")
+        return
+
+    if not tasks:
+        loop_state.set_state("waiting_tasks", f"{loop_state.tasks_file} has no tasks")
+        return
+
+    validation_error = validate_loaded_tasks(loop_state)
+    if validation_error:
+        loop_state.set_state("waiting_blocked", validation_error)
+        return
+
     # Get next task
     next_task = dag.get_next_task(tasks)
 
@@ -269,6 +382,7 @@ def advance_loop(loop_state: LoopState, tui_state: tui.TUIState) -> None:
             loop_state.set_state("waiting_done", f"all {done_n}/{total} tasks complete")
             if not was_done:
                 dag.log_event(loop_state.history_file, "all_tasks_complete")
+                _run_loop_completed_hook(loop_state, counts, total)
         else:
             loop_state.set_state("waiting_blocked", dag.blocked_reason(tasks))
         return
@@ -276,16 +390,26 @@ def advance_loop(loop_state: LoopState, tui_state: tui.TUIState) -> None:
     task_id = next_task["id"]
     task_type = next_task.get("type", "work")
 
-    # Git must be clean before starting any non-pause task.
+    # Git must be on a branch and clean before starting any non-pause task.
     # Check here (not every tick) because git status is expensive.
-    if task_type != "pause" and not git.is_clean():
-        dirty_info = git.dirty_summary()
-        dag.log_event(loop_state.history_file, "git_dirty", task_id, dirty_info)
-        pause_id = dag.insert_dirty_pause(loop_state.tasks_file, task_id, dirty_info)
-        loop_state.reload_tasks()
-        if pause_id:
-            dag.log_event(loop_state.history_file, "dirty_pause_inserted", pause_id)
-        return
+    if task_type != "pause":
+        if not git.is_on_branch():
+            reason = "no current git branch; create or checkout a branch before resuming"
+            dag.log_event(loop_state.history_file, "git_no_branch", task_id, reason)
+            pause_id = dag.insert_no_branch_pause(loop_state.tasks_file, task_id)
+            loop_state.reload_tasks()
+            if pause_id:
+                dag.log_event(loop_state.history_file, "no_branch_pause_inserted", pause_id)
+            return
+
+        if not git.is_clean():
+            dirty_info = git.dirty_summary()
+            dag.log_event(loop_state.history_file, "git_dirty", task_id, dirty_info)
+            pause_id = dag.insert_dirty_pause(loop_state.tasks_file, task_id, dirty_info)
+            loop_state.reload_tasks()
+            if pause_id:
+                dag.log_event(loop_state.history_file, "dirty_pause_inserted", pause_id)
+            return
 
     loop_state.set_state("running", next_task["id"])
     _write_state(loop_state, "running")
@@ -299,7 +423,8 @@ def advance_loop(loop_state: LoopState, tui_state: tui.TUIState) -> None:
     dag.increment_attempt(loop_state.tasks_file, task_id)
     loop_state.reload_tasks()
 
-    attempt = next_task.get("attempt", 0) + 1
+    current_task = dag.get_task(loop_state.tasks, task_id) or next_task
+    attempt = current_task.get("attempt", next_task.get("attempt", 0) + 1)
     dag.log_event(
         loop_state.history_file, "task_started", task_id,
         f"attempt={attempt},type={task_type}",
@@ -320,17 +445,19 @@ def advance_loop(loop_state: LoopState, tui_state: tui.TUIState) -> None:
         git.delete_base_sha(loop_state.ralpanda_dir)
         dag.update_task_status(loop_state.tasks_file, task_id, "done")
         dag.log_event(loop_state.history_file, "base_sha_deleted", task_id)
+        _run_task_finished_hook(loop_state, task_id)
         _finish_task(loop_state)
 
     elif task_type == "pause":
-        pause_reason = next_task.get("pause_reason") or next_task.get("title", "manual pause")
+        pause_reason = current_task.get("pause_reason") or current_task.get("title", "manual pause")
         loop_state.set_state("paused", f"{task_id}: {pause_reason}")
         _write_state(loop_state, "paused")
         if pause_reason:
             (loop_state.ralpanda_dir / "pause_reason").write_text(pause_reason)
         dag.log_event(loop_state.history_file, "loop_paused", task_id, pause_reason)
+        _run_loop_paused_hook(loop_state, current_task, pause_reason)
 
-    elif task_type == "review":
+    elif task_type in ("review", "review_compatibility"):
         review = agent.start_review(
             loop_state.ralpanda_dir,
             loop_state.tasks_file,
@@ -341,15 +468,33 @@ def advance_loop(loop_state: LoopState, tui_state: tui.TUIState) -> None:
         if review.phase == "done":
             # No checks defined
             dag.update_task_status(loop_state.tasks_file, task_id, "done")
+            _run_task_finished_hook(loop_state, task_id)
             _finish_task(loop_state)
 
     else:
         # Work task
         task_prompt = prompt.build_work_prompt(
-            next_task, tasks, loop_state.ralpanda_dir,
+            current_task, loop_state.tasks, loop_state.ralpanda_dir,
         )
         log_path = dag.task_log_path(loop_state.ralpanda_dir, task_id)
-        proc = agent.spawn_agent(task_prompt, loop_state.model, log_path)
+        agent_namespace = dag.work_agent_namespace()
+        outcome_path = dag.outcome_path(
+            loop_state.ralpanda_dir,
+            task_id,
+            attempt,
+            agent_namespace,
+        ).resolve()
+        proc = agent.spawn_agent(
+            task_prompt,
+            loop_state.model,
+            log_path,
+            ralpanda_dir=loop_state.ralpanda_dir,
+            task_id=task_id,
+            attempt=attempt,
+            agent_kind="work",
+            agent_namespace=agent_namespace,
+            expected_outcome_path=outcome_path,
+        )
         loop_state.agent_proc = proc
         (loop_state.ralpanda_dir / "agent.pid").write_text(str(proc.pid))
 
@@ -358,25 +503,57 @@ def poll_agents(loop_state: LoopState) -> None:
     """Poll running agent or review state machine."""
     # Handle force quit
     if loop_state.force_quit and loop_state.agent_proc:
-        loop_state.agent_proc.terminate()
-        try:
-            loop_state.agent_proc.wait(timeout=5)
-        except Exception:
-            loop_state.agent_proc.kill()
-        agent.close_agent(loop_state.agent_proc)
+        agent.terminate_agent_process(loop_state.agent_proc)
+        agent.finish_agent_process(loop_state.agent_proc)
         loop_state.agent_proc = None
+        if loop_state.current_task_id:
+            dag.update_task_status(
+                loop_state.tasks_file,
+                loop_state.current_task_id,
+                "pending",
+            )
+            dag.log_event(
+                loop_state.history_file,
+                "agent_force_quit",
+                loop_state.current_task_id,
+            )
         _finish_task(loop_state)
         return
 
     # Poll work agent
     if loop_state.agent_proc and not loop_state.review_state:
         exit_code = loop_state.agent_proc.poll()
+        if exit_code is None and loop_state.current_task_id:
+            loop_state.reload_tasks()
+            task = dag.get_task(loop_state.tasks, loop_state.current_task_id)
+            attempt = task.get("attempt", 1) if task else 1
+            agent_namespace = dag.work_agent_namespace()
+            outcome, outcome_path = agent.stable_outcome_ready(
+                loop_state.agent_proc,
+                loop_state.ralpanda_dir,
+                loop_state.current_task_id,
+                attempt,
+                agent_namespace,
+                "work",
+            )
+            if outcome and outcome_path:
+                agent.terminate_stale_process_after_outcome(
+                    loop_state.agent_proc,
+                    loop_state.history_file,
+                    loop_state.current_task_id,
+                    agent_namespace=agent_namespace,
+                    outcome_path=outcome_path,
+                )
+                exit_code = loop_state.agent_proc.returncode
+                if exit_code is None:
+                    exit_code = 0
+
         if exit_code is not None:
-            agent.close_agent(loop_state.agent_proc)
+            agent.finish_agent_process(loop_state.agent_proc)
             loop_state.agent_proc = None
             (loop_state.ralpanda_dir / "agent.pid").unlink(missing_ok=True)
 
-            agent.process_work_result(
+            finish = agent.process_work_result(
                 loop_state.ralpanda_dir,
                 loop_state.tasks_file,
                 loop_state.current_task_id,
@@ -384,6 +561,12 @@ def poll_agents(loop_state: LoopState) -> None:
                 loop_state.max_attempts,
                 loop_state.history_file,
             )
+            if finish and loop_state.current_task_id:
+                _run_task_finished_hook(
+                    loop_state,
+                    loop_state.current_task_id,
+                    finish.get("commit_sha"),
+                )
 
             _post_task(loop_state)
             _finish_task(loop_state)
@@ -417,6 +600,7 @@ def poll_agents(loop_state: LoopState) -> None:
                 dag.log_event(loop_state.history_file, "committed", rs.task_id, f"sha={sha}")
 
             loop_state.review_state = None
+            _run_task_finished_hook(loop_state, rs.task_id, sha)
             _post_task(loop_state)
             _finish_task(loop_state)
 
@@ -435,6 +619,102 @@ def poll_agents(loop_state: LoopState) -> None:
             loop_state.set_state("running", "resumed from pause")
             _write_state(loop_state, "running")
             _finish_task(loop_state)
+
+
+def _run_task_finished_hook(
+    loop_state: LoopState,
+    task_id: str,
+    commit_sha: str | None = None,
+) -> None:
+    """Emit task.finished for non-pause tasks that reach a final state."""
+    loop_state.reload_tasks()
+    task = dag.get_task(loop_state.tasks, task_id)
+    if not task or task.get("type") == "pause":
+        return
+
+    payload = _event_payload(loop_state)
+    payload["task"] = _task_payload(task)
+    if commit_sha:
+        payload["commit_sha"] = commit_sha
+
+    hooks.run_event(
+        "task.finished",
+        payload,
+        loop_state.ralpanda_dir,
+        history_file=loop_state.history_file,
+    )
+
+
+def _run_loop_paused_hook(
+    loop_state: LoopState,
+    task: dict,
+    pause_reason: str,
+) -> None:
+    loop_state.reload_tasks()
+    paused_task = dag.get_task(loop_state.tasks, task["id"]) or task
+    if "pause_reason" not in paused_task and pause_reason:
+        paused_task = {**paused_task, "pause_reason": pause_reason}
+
+    payload = _event_payload(loop_state)
+    payload["task"] = _task_payload(paused_task)
+    hooks.run_event(
+        "loop.paused",
+        payload,
+        loop_state.ralpanda_dir,
+        history_file=loop_state.history_file,
+    )
+
+
+def _run_loop_completed_hook(
+    loop_state: LoopState,
+    counts: dict[str, int],
+    total: int,
+) -> None:
+    payload = _event_payload(loop_state, counts=counts, total=total)
+    hooks.run_event(
+        "loop.completed",
+        payload,
+        loop_state.ralpanda_dir,
+        history_file=loop_state.history_file,
+    )
+
+
+def _event_payload(
+    loop_state: LoopState,
+    *,
+    counts: dict[str, int] | None = None,
+    total: int | None = None,
+) -> dict:
+    loop_state.reload_tasks()
+    tasks = loop_state.tasks
+    next_task = dag.get_next_task(tasks)
+    loop = {
+        "state": loop_state.state,
+        "state_info": loop_state.state_info,
+        "current_task_id": loop_state.current_task_id,
+        "next_task_id": next_task["id"] if next_task else None,
+        "counts": counts if counts is not None else dag.task_counts(tasks),
+        "total_tasks": total if total is not None else len(tasks),
+    }
+    return {"loop": loop}
+
+
+def _task_payload(task: dict) -> dict:
+    keys = (
+        "id",
+        "title",
+        "type",
+        "status",
+        "plan_source",
+        "attempt",
+        "created_at",
+        "started_at",
+        "completed_at",
+        "pause_reason",
+        "outcome",
+        "usage",
+    )
+    return {key: task[key] for key in keys if key in task}
 
 
 def _post_task(loop_state: LoopState) -> None:
@@ -477,39 +757,27 @@ def cleanup(loop_state: LoopState) -> None:
     """Clean up on exit."""
     # Kill agent if running
     if loop_state.agent_proc:
-        try:
-            loop_state.agent_proc.terminate()
-            loop_state.agent_proc.wait(timeout=5)
-        except Exception:
-            try:
-                loop_state.agent_proc.kill()
-            except Exception:
-                pass
-        agent.close_agent(loop_state.agent_proc)
+        agent.terminate_agent_process(loop_state.agent_proc)
+        agent.finish_agent_process(loop_state.agent_proc)
 
     # Kill any review procs
     if loop_state.review_state:
         for proc in loop_state.review_state.parallel_procs.values():
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-            agent.close_agent(proc)
+            agent.terminate_agent_process(proc)
+            agent.finish_agent_process(proc)
         if loop_state.review_state.current_isolated_proc:
-            try:
-                loop_state.review_state.current_isolated_proc.terminate()
-            except Exception:
-                pass
-            agent.close_agent(loop_state.review_state.current_isolated_proc)
+            agent.terminate_agent_process(
+                loop_state.review_state.current_isolated_proc,
+            )
+            agent.finish_agent_process(
+                loop_state.review_state.current_isolated_proc,
+            )
         if loop_state.review_state.coordinator_proc:
-            try:
-                loop_state.review_state.coordinator_proc.terminate()
-            except Exception:
-                pass
-            agent.close_agent(loop_state.review_state.coordinator_proc)
+            agent.terminate_agent_process(loop_state.review_state.coordinator_proc)
+            agent.finish_agent_process(loop_state.review_state.coordinator_proc)
 
     # Reset any task that was running back to pending so it can be retried
-    if loop_state.current_task_id:
+    if loop_state.current_task_id and loop_state.tasks_file.exists():
         dag.update_task_status(loop_state.tasks_file, loop_state.current_task_id, "pending")
 
     # Write state files
@@ -549,7 +817,7 @@ def main_loop(stdscr, loop_state: LoopState) -> None:
         if (
             loop_state.agent_proc is None
             and loop_state.review_state is None
-            and loop_state.state in ("running", "waiting_done", "waiting_blocked")
+            and loop_state.state in ("running", "waiting_tasks", "waiting_done", "waiting_blocked")
             and not loop_state.should_exit
         ):
             advance_loop(loop_state, tui_state)
@@ -559,13 +827,13 @@ def main_loop(stdscr, loop_state: LoopState) -> None:
         tail_task_id = selected["id"] if selected else loop_state.current_task_id
         tui.tail_log(tui_state, loop_state.ralpanda_dir, tail_task_id)
 
-        # 4b. Tail check log for review tasks
-        if selected and selected.get("type") == "review":
-            checks = selected.get("checks", [])
+        # 4b. Tail check log for review-style tasks
+        if tui.is_check_task(selected):
+            checks = dag.review_checks(selected)
             idx = tui_state.selected_check_idx
             if idx < len(checks):
                 check_name = checks[idx].get("name", f"check-{idx}")
-            elif idx == len(checks):
+            elif selected.get("type") == "review" and idx == len(checks):
                 check_name = "coordinator"
             else:
                 check_name = None
@@ -600,10 +868,10 @@ def main() -> None:
         sys.exit(1)
 
     # Initialize
-    for subdir in ("logs", "sentinels", "outcomes"):
+    for subdir in ("logs", "sentinels", "outcomes", "running"):
         (ralpanda_dir / subdir).mkdir(parents=True, exist_ok=True)
     (ralpanda_dir / "loop.pid").write_text(str(os.getpid()))
-    _write_state(loop_state, "running")
+    _write_state(loop_state, loop_state.state)
 
     # Clear stale sentinels
     for name in ("exit", "resume"):

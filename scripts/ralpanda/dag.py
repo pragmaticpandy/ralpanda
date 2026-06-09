@@ -9,9 +9,20 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+
+
+PLAN_COMPLETENESS_CHECK_NAME = "plan-completeness"
+
+VALID_OUTCOME_STATUSES_BY_KIND = {
+    "work": {"done", "failed", "split"},
+    "review_check": {"pass", "fail", "infra_fail"},
+    "review_compatibility_check": {"pass", "fail", "infra_fail"},
+    "coordinator": {"tasks_created", "infra_fail"},
+}
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +97,223 @@ def plan_slug_from_source(plan_source: str | None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Agent outcome/running paths
+# ---------------------------------------------------------------------------
+
+def safe_path_component(value: str | None) -> str:
+    """Return a filesystem-safe path component for task/check namespaces."""
+    text = str(value or "unnamed").strip()
+    text = text.replace("/", "-")
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "-", text)
+    text = text.strip(".-")
+    return text or "unnamed"
+
+
+def task_safe_id(task_id: str) -> str:
+    """Return the stable filesystem-safe directory name for a task ID."""
+    return task_id.replace("/", "-")
+
+
+def work_agent_namespace() -> str:
+    """Return the namespace for a work-task agent."""
+    return "work"
+
+
+def review_agent_namespace(
+    task_type: str,
+    stage_name: str | None,
+    check_name: str | None,
+) -> str:
+    """Return the namespaced ID for a review/check agent."""
+    phase = (
+        "review_compatibility"
+        if task_type == "review_compatibility"
+        else "review"
+    )
+    return "/".join((
+        phase,
+        safe_path_component(stage_name or "checks"),
+        safe_path_component(check_name or "check"),
+    ))
+
+
+def coordinator_agent_namespace(coordinator_attempt: int) -> str:
+    """Return the namespaced ID for a coordinator attempt."""
+    return f"coordinator/attempt-{coordinator_attempt}"
+
+
+def agent_kind_for_check_task(task_type: str) -> str:
+    """Return the transport kind for a review-style task."""
+    if task_type == "review_compatibility":
+        return "review_compatibility_check"
+    return "review_check"
+
+
+def _agent_namespace_path(
+    root: Path,
+    task_id: str,
+    attempt: int,
+    namespace: str,
+) -> Path:
+    """Return a nested path for a task attempt and agent namespace."""
+    parts = [safe_path_component(p) for p in namespace.split("/") if p]
+    if not parts:
+        parts = ["agent"]
+    base = root / task_safe_id(task_id) / f"attempt-{attempt}"
+    return base.joinpath(*parts[:-1], f"{parts[-1]}.json")
+
+
+def outcome_path(
+    ralpanda_dir: Path,
+    task_id: str,
+    attempt: int | None = None,
+    namespace: str | None = None,
+) -> Path:
+    """Return the outcome path for an agent.
+
+    New agents use attempt-scoped outcome files:
+    .ralpanda/outcomes/<task-safe-id>/attempt-<n>/<namespace>.json
+
+    The legacy two-argument behavior is retained for callers/tests that only
+    need the old task-level location.
+    """
+    safe_id = task_safe_id(task_id)
+    outcomes_dir = ralpanda_dir / "outcomes"
+    outcomes_dir.mkdir(parents=True, exist_ok=True)
+    if attempt is None:
+        return outcomes_dir / f"{safe_id}.json"
+    return _agent_namespace_path(
+        outcomes_dir,
+        task_id,
+        attempt,
+        namespace or work_agent_namespace(),
+    )
+
+
+def running_metadata_path(
+    ralpanda_dir: Path,
+    task_id: str,
+    attempt: int,
+    namespace: str,
+) -> Path:
+    """Return the running metadata path for an agent spawn."""
+    root = ralpanda_dir / "running"
+    root.mkdir(parents=True, exist_ok=True)
+    return _agent_namespace_path(root, task_id, attempt, namespace)
+
+
+def atomic_write_json(path: Path, payload: dict) -> None:
+    """Atomically write a JSON object to *path*."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def read_json_file(path: Path) -> tuple[dict | None, str | None]:
+    """Read a JSON object, returning (data, error)."""
+    if not path.exists():
+        return None, "missing outcome file"
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except json.JSONDecodeError as exc:
+        return None, f"invalid JSON: {exc}"
+    except OSError as exc:
+        return None, f"could not read outcome file: {exc}"
+    if not isinstance(data, dict):
+        return None, "outcome must be a JSON object"
+    return data, None
+
+
+def validate_outcome_envelope(
+    outcome: dict,
+    *,
+    task_id: str,
+    attempt: int,
+    agent_kind: str,
+    agent_namespace: str,
+) -> str | None:
+    """Validate the shared on-disk outcome transport envelope."""
+    required = {
+        "schema_version",
+        "task_id",
+        "attempt",
+        "agent",
+        "status",
+        "summary",
+        "payload",
+    }
+    missing = sorted(required - set(outcome))
+    if missing:
+        return f"outcome missing fields: {', '.join(missing)}"
+    if outcome.get("schema_version") != 1:
+        return "outcome schema_version must be 1"
+    if outcome.get("task_id") != task_id:
+        return "outcome task_id does not match expected task"
+    if outcome.get("attempt") != attempt:
+        return "outcome attempt does not match expected attempt"
+
+    agent = outcome.get("agent")
+    if not isinstance(agent, dict):
+        return "outcome agent must be an object"
+    if agent.get("kind") != agent_kind:
+        return "outcome agent.kind does not match expected kind"
+    if agent.get("namespace") != agent_namespace:
+        return "outcome agent.namespace does not match expected namespace"
+
+    valid_statuses = VALID_OUTCOME_STATUSES_BY_KIND.get(agent_kind)
+    if not valid_statuses:
+        return f"unknown agent kind: {agent_kind}"
+    if outcome.get("status") not in valid_statuses:
+        return (
+            f"invalid outcome status for {agent_kind}: "
+            f"{outcome.get('status')!r}"
+        )
+
+    if not isinstance(outcome.get("summary"), str):
+        return "outcome summary must be a string"
+    if not isinstance(outcome.get("payload"), dict):
+        return "outcome payload must be an object"
+
+    if (
+        agent_kind in ("review_check", "review_compatibility_check")
+        and outcome.get("status") in ("fail", "infra_fail")
+        and not outcome.get("summary", "").strip()
+    ):
+        return "failed review/check outcomes must include a non-empty summary"
+
+    return None
+
+
+def read_valid_outcome(
+    ralpanda_dir: Path,
+    task_id: str,
+    attempt: int,
+    agent_namespace: str,
+    agent_kind: str,
+) -> tuple[dict | None, str | None, Path]:
+    """Read and validate an expected outcome file."""
+    path = outcome_path(ralpanda_dir, task_id, attempt, agent_namespace)
+    outcome, error = read_json_file(path)
+    if error:
+        return None, error, path
+    assert outcome is not None
+    error = validate_outcome_envelope(
+        outcome,
+        task_id=task_id,
+        attempt=attempt,
+        agent_kind=agent_kind,
+        agent_namespace=agent_namespace,
+    )
+    if error:
+        return None, error, path
+    return outcome, None, path
+
+
+# ---------------------------------------------------------------------------
 # Log file paths
 # ---------------------------------------------------------------------------
 
@@ -99,16 +327,8 @@ def task_log_path(ralpanda_dir: Path, task_id: str, suffix: str = "") -> Path:
     logs_dir = ralpanda_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     if suffix:
-        return logs_dir / f"{safe_id}-{suffix}.jsonl"
+        return logs_dir / f"{safe_id}-{safe_path_component(suffix)}.jsonl"
     return logs_dir / f"{safe_id}.jsonl"
-
-
-def outcome_path(ralpanda_dir: Path, task_id: str) -> Path:
-    """Return the outcome file path for a task."""
-    safe_id = task_id.replace("/", "-")
-    outcomes_dir = ralpanda_dir / "outcomes"
-    outcomes_dir.mkdir(parents=True, exist_ok=True)
-    return outcomes_dir / f"{safe_id}.json"
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +395,77 @@ def get_task(tasks: list[dict], task_id: str) -> dict | None:
     return None
 
 
+def review_check_stages(task: dict | None) -> tuple[list[dict], list[dict]]:
+    """Return flattened review checks and ordered stage metadata.
+
+    Review tasks historically used a flat ``checks`` array. Newer tasks may use
+    ``check_stages`` so cheaper checks can gate more expensive later stages.
+    Plan-completeness checks are treated as cheap coverage gates: when a
+    multi-stage task has one in a later stage, normalize it into the first stage.
+    This helper keeps the runtime and TUI compatible with both shapes.
+    """
+    if not task:
+        return [], []
+
+    configured_stages = (
+        task.get("check_stages")
+        or task.get("review_check_stages")
+        or task.get("stages")
+    )
+    if isinstance(configured_stages, list) and configured_stages:
+        normalized_stages: list[dict] = []
+        for stage_num, stage in enumerate(configured_stages, start=1):
+            if not isinstance(stage, dict):
+                continue
+            stage_checks = stage.get("checks", [])
+            if not isinstance(stage_checks, list):
+                continue
+            normalized_stages.append({
+                "name": stage.get("name") or f"stage-{stage_num}",
+                "checks": [
+                    dict(check)
+                    for check in stage_checks
+                    if isinstance(check, dict)
+                ],
+            })
+
+        if len(normalized_stages) > 1:
+            moved_checks: list[dict] = []
+            for stage in normalized_stages[1:]:
+                kept_checks = []
+                for check in stage["checks"]:
+                    if check.get("name") == PLAN_COMPLETENESS_CHECK_NAME:
+                        moved_checks.append(check)
+                    else:
+                        kept_checks.append(check)
+                stage["checks"] = kept_checks
+            normalized_stages[0]["checks"].extend(moved_checks)
+
+        checks: list[dict] = []
+        stages: list[dict] = []
+        for stage in normalized_stages:
+            name = stage["name"]
+            indices: list[int] = []
+            for check in stage["checks"]:
+                copied = dict(check)
+                copied.setdefault("stage", name)
+                indices.append(len(checks))
+                checks.append(copied)
+            stages.append({"name": name, "check_indices": indices})
+        return checks, stages
+
+    checks = [dict(c) for c in task.get("checks", []) if isinstance(c, dict)]
+    if not checks:
+        return [], []
+    return checks, [{"name": "checks", "check_indices": list(range(len(checks)))}]
+
+
+def review_checks(task: dict | None) -> list[dict]:
+    """Return flattened review checks for display/counting."""
+    checks, _ = review_check_stages(task)
+    return checks
+
+
 def validate_dag(tasks: list[dict]) -> bool:
     """Return True if the dependency graph is acyclic."""
     graph = {t["id"]: t.get("depends_on", []) for t in tasks}
@@ -206,11 +497,26 @@ def validate_unique_ids(tasks: list[dict]) -> list[str]:
     return [tid for tid, count in seen.items() if count > 1]
 
 
+def validate_dependency_refs(tasks: list[dict]) -> list[str]:
+    """Return dependency references that do not point at a task ID."""
+    task_ids = {t["id"] for t in tasks}
+    missing: list[str] = []
+    for t in tasks:
+        task_id = t["id"]
+        for dep_id in t.get("depends_on", []):
+            if dep_id not in task_ids:
+                missing.append(f"{task_id} -> {dep_id}")
+    return missing
+
+
 def validate_tasks(tasks: list[dict]) -> str:
     """Return 'valid' or an error description."""
     dupes = validate_unique_ids(tasks)
     if dupes:
         return f"duplicate_ids: {', '.join(dupes)}"
+    missing_deps = validate_dependency_refs(tasks)
+    if missing_deps:
+        return f"missing_dependencies: {', '.join(missing_deps)}"
     if not validate_dag(tasks):
         return "cycle_detected"
     return "valid"
@@ -385,10 +691,17 @@ def insert_pause_before(tasks_file: Path, before_id: str, plan_source: str | Non
         return pause_id
 
 
-def insert_dirty_pause(tasks_file: Path, before_id: str, dirty_info: str) -> str | None:
-    """Insert a pause task before *before_id* because git is dirty.
+def insert_git_preflight_pause(
+    tasks_file: Path,
+    before_id: str,
+    title: str,
+    pause_reason: str,
+    description: str,
+    duplicate_reason_prefix: str,
+) -> str | None:
+    """Insert a pause task before *before_id* for a git preflight failure.
 
-    Returns the pause task ID, or None if a dirty-pause already blocks this task.
+    Returns the pause task ID, or None if a matching pause already blocks this task.
     """
     with locked_tasks(tasks_file) as data:
         tasks = data["tasks"]
@@ -400,14 +713,14 @@ def insert_dirty_pause(tasks_file: Path, before_id: str, dirty_info: str) -> str
         if not target:
             return None
 
-        # Don't stack dirty pauses — check if one already blocks this task
+        # Don't stack identical preflight pauses while one already blocks this task.
         target_deps = set(target.get("depends_on", []))
         for t in tasks:
             if (
                 t["type"] == "pause"
                 and t["status"] == "pending"
                 and t["id"] in target_deps
-                and t.get("pause_reason", "").startswith("git dirty")
+                and t.get("pause_reason", "").startswith(duplicate_reason_prefix)
             ):
                 return None
 
@@ -415,13 +728,13 @@ def insert_dirty_pause(tasks_file: Path, before_id: str, dirty_info: str) -> str
         pause_id = next_task_id(tasks, slug)
         pause_task = {
             "id": pause_id,
-            "title": "Pause (git dirty)",
+            "title": title,
             "type": "pause",
-            "pause_reason": f"git dirty: {dirty_info}",
+            "pause_reason": pause_reason,
             "status": "pending",
             "depends_on": list(target.get("depends_on", [])),
             "plan_source": target.get("plan_source"),
-            "description": f"Auto-inserted because git was dirty before starting {before_id}.",
+            "description": description,
             "acceptance_criteria": [],
             "outcome": None,
             "attempt": 0,
@@ -444,6 +757,36 @@ def insert_dirty_pause(tasks_file: Path, before_id: str, dirty_info: str) -> str
                 break
 
         return pause_id
+
+
+def insert_dirty_pause(tasks_file: Path, before_id: str, dirty_info: str) -> str | None:
+    """Insert a pause task before *before_id* because git is dirty.
+
+    Returns the pause task ID, or None if a dirty-pause already blocks this task.
+    """
+    return insert_git_preflight_pause(
+        tasks_file,
+        before_id,
+        "Pause (git dirty)",
+        f"git dirty: {dirty_info}",
+        f"Auto-inserted because git was dirty before starting {before_id}.",
+        "git dirty",
+    )
+
+
+def insert_no_branch_pause(tasks_file: Path, before_id: str) -> str | None:
+    """Insert a pause task before *before_id* because git is not on a branch.
+
+    Returns the pause task ID, or None if a no-branch pause already blocks this task.
+    """
+    return insert_git_preflight_pause(
+        tasks_file,
+        before_id,
+        "Pause (no git branch)",
+        "git branch required: checkout or create a branch before resuming",
+        f"Auto-inserted because git was not on a branch before starting {before_id}.",
+        "git branch required",
+    )
 
 
 def insert_global_pause(tasks_file: Path) -> str | None:
